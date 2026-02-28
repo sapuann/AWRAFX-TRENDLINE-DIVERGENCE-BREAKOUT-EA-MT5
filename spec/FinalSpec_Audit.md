@@ -1,10 +1,33 @@
-# Final Specification Audit
+# LOCKED Spec Content
 
-This document serves as the final specification for the audit processes within the project. It outlines the key components and the operational guidelines you need to understand.
+## H1 Divergence
 
-## Key Points
-- Point 1: Explanation here.
-- Point 2: Explanation here.
+Description of H1 divergence...
 
----
-*End of Document*
+## Strict CHoCH
+
+Description of strict CHoCH...
+
+## M5 Touch/Reclaim/Micro-BOS
+
+Description of M5 touch/reclaim/micro-BOS...
+
+## Tolerance Formula
+
+Description of tolerance formula...
+
+## Scoring
+
+Description of scoring...
+
+## KPI
+
+Description of KPI...
+
+## Stop Rule
+
+Description of stop rule...
+
+## Single-Change
+
+Description of single-change...

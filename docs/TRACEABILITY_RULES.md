@@ -1,26 +1,25 @@
-# Traceability Rules
+# Audit-Trace Specification
 
-## Strict Audit-Trace Specification
+## CSV Schema
+- **Column 1:** Timestamp (UTC) - Format: YYYY-MM-DD HH:MM:SS
+- **Column 2:** RowType - Values: SIGNAL, REJECT
+- **Column 3:** ReasonCode - Must be from the locked list below
+- **Column 4:** Threshold - Indicates the stop rule threshold
+- **Column 5:** ArtifactPath - Path to the relevant artifact
 
-### Required Per-Signal Fields
-- **SignalID**: Unique identifier for the signal.
-- **Divergence Pivots**: Time and price details for divergence.
-- **RSI**: Relative Strength Index values.
-- **CHoCH Candle**: Change of Character Candle details.
-- **Trigger**: Conditions that trigger the signal.
-- **Invalidation**: Rules for invalidating signals.
-- **M5 Touch/Reclaim Times**: Times for M5 touch and reclaim events.
-- **Micro-BOS Level/Time**: Details on micro-Break of Structure levels and their timestamps.
-- **Entry Time/Price**: When and at what price the signal triggers an entry.
-- **Score Breakdown**: Detailed scoring metrics for the signal.
-- **KPI Result**: Key Performance Indicator results linked to the signal.
+## RowType Definitions
+- **SIGNAL:** Indicates a signal generation.
+- **REJECT:** Indicates a signal rejection.
 
-### Reason Codes
-- Define codes to explain reasons for actions taken based on signals.
+## Locked ReasonCode List
+- REASON_CODE_1
+- REASON_CODE_2
+- REASON_CODE_3
 
-### File Locations for CSV Artifacts
-- Document the file paths where CSV artifacts are stored.
+## Stop Rule Thresholds
+- Minimum Threshold: 0.1
+- Maximum Threshold: 10.0
 
-### Stop Rule
-- Outline the rules to implement stops based on signal evaluations.
-
+## Artifact Paths
+- /path/to/artifact1
+- /path/to/artifact2

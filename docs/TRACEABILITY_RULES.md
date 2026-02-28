@@ -1,25 +1,56 @@
-# Audit-Trace Specification
+# Traceability Rules (LOCKED)
 
-## CSV Schema
-- **Column 1:** Timestamp (UTC) - Format: YYYY-MM-DD HH:MM:SS
-- **Column 2:** RowType - Values: SIGNAL, REJECT
-- **Column 3:** ReasonCode - Must be from the locked list below
-- **Column 4:** Threshold - Indicates the stop rule threshold
-- **Column 5:** ArtifactPath - Path to the relevant artifact
+## CSV location
+Default: `MQL5/Files/FinalSpec_Audit.csv`
+Optional: `Common/Files/FinalSpec_Audit.csv`
 
-## RowType Definitions
-- **SIGNAL:** Indicates a signal generation.
-- **REJECT:** Indicates a signal rejection.
+## RowType
+- SIGNAL
+- REJECT
 
-## Locked ReasonCode List
-- REASON_CODE_1
-- REASON_CODE_2
-- REASON_CODE_3
+## Required columns (locked minimum)
+Identity:
+- RunID, SignalID, Symbol, Bias, Digits, Point
 
-## Stop Rule Thresholds
-- Minimum Threshold: 0.1
-- Maximum Threshold: 10.0
+H1 Divergence:
+- DivType
+- H1_Pivot1_Time, H1_Pivot1_Price, H1_Pivot1_RSI
+- H1_Pivot2_Time, H1_Pivot2_Price, H1_Pivot2_RSI
+- H1_Div_RSIDelta, H1_Div_SpanBars
 
-## Artifact Paths
-- /path/to/artifact1
-- /path/to/artifact2
+CHoCH:
+- H1_CHoCH_Time, H1_CHoCH_Close
+- TriggerLevel, InvalidationLevel
+
+Regime:
+- EMA200_H1, ATR_H1, TrendStrongFlag, RegimeReject
+
+M5:
+- M5_Touch_Time, M5_Reclaim_Time
+- M5_MicroLevel, M5_MicroBOS_Time
+
+Entry:
+- Entry_Time, Entry_Price
+
+Score:
+- Score_Total, MinScore
+- Score_DivStrength, Score_PivotSignificance, Score_RegimeQuality, Score_RoomToMove
+
+KPI:
+- KPI_LookaheadBarsM5, Result, MAE_R, MFE_R
+Meta:
+- Spread_Points, Tol_Price, Notes
+Reject-only:
+- ReasonCode, ReasonText
+
+## Locked ReasonCodes
+- REJECT_SPREAD_TOO_HIGH
+- REJECT_REGIME_STRONG_TREND
+- REJECT_NO_DIVERGENCE
+- REJECT_NO_CHOCH
+- REJECT_TIMEOUT_WAIT_RETEST
+- REJECT_NO_RECLAIM
+- REJECT_NO_MICROBOS
+- REJECT_SCORE_BELOW_MIN
+- REJECT_DUPLICATE_SIGNAL
+- REJECT_INVALID_R

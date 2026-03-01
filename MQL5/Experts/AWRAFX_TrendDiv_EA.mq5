@@ -24,6 +24,9 @@ input double   InpTrendATRMult   = 2.0;         // ATR multiplier for trend stre
 input int      InpMinScore       = 60;          // Minimum score for signal
 input double   InpMaxSpread      = 50;          // Max spread in points
 input bool     InpWriteCSV       = true;        // Write audit CSV
+input int      InpCHoCHTimeout   = 20;          // Max H1 bars to wait for CHoCH
+input double   InpCHoCHTolATR    = 0.05;        // CHoCH tolerance as fraction of ATR
+input double   InpCHoCHMinBody   = 0.50;        // Min body/range ratio for CHoCH candle
 
 //--- Signal State Machine
 enum ESignalState
@@ -118,6 +121,7 @@ struct SSymbolData
    ESignalState   State;
    datetime       LastBarTimeH1;
    datetime       LastBarTimeM5;
+   datetime       CHoCH_WaitStartBarTime; // H1 bar time when CHoCH wait started
 
    // Indicator handles — H1
    int            hRSI_H1;
@@ -727,6 +731,195 @@ bool DetectH1Divergence(SSymbolData &sd)
 }
 
 //+------------------------------------------------------------------+
+//|  Setup CHoCH watch levels when entering STATE_WAIT_CHOCH          |
+//|  Finds the opposing swing point to use as the CHoCH trigger level |
+//|  and sets TriggerLevel + InvalidationLevel in the signal context  |
+//+------------------------------------------------------------------+
+void SetupCHoCHLevels(SSymbolData &sd)
+{
+   SSignalContext &ctx = sd.Ctx;
+
+   // Convert stored pivot times to bar indices on H1
+   int p1Bar = iBarShift(ctx.Symbol, PERIOD_H1, ctx.H1_Pivot1_Time, false);
+   int p2Bar = iBarShift(ctx.Symbol, PERIOD_H1, ctx.H1_Pivot2_Time, false);
+
+   // Search from current bar back to at least Pivot1 (add extra buffer for pivot width)
+   int barsAvail  = Bars(ctx.Symbol, PERIOD_H1);
+   int searchBars = p1Bar + InpPivotBars + 5;
+   if(searchBars >= barsAvail - InpPivotBars)
+      searchBars = barsAvail - InpPivotBars - 1;
+   if(searchBars < InpPivotBars * 2 + 1) return;
+
+   if(ctx.Bias == "BULL")
+   {
+      // For bullish divergence: find the highest swing high between Pivot1 and Pivot2
+      // That high is the resistance level price must close above to confirm CHoCH
+      int    swHighIdx[];
+      double swHighPrc[];
+      int cnt = FindPivots(ctx.Symbol, PERIOD_H1, 1, InpPivotBars,
+                           searchBars, 20, swHighIdx, swHighPrc);
+
+      double bestHigh = 0.0;
+      bool   found    = false;
+      for(int i = 0; i < cnt; i++)
+      {
+         // Accept pivots within [p2Bar .. p1Bar] (higher index = older bar)
+         if(swHighIdx[i] >= p2Bar && swHighIdx[i] <= p1Bar)
+         {
+            if(!found || swHighPrc[i] > bestHigh)
+            {
+               bestHigh = swHighPrc[i];
+               found    = true;
+            }
+         }
+      }
+      // Fallback: use the most recent swing high if none found in range
+      if(!found && cnt > 0)
+         bestHigh = swHighPrc[0];
+
+      ctx.TriggerLevel      = bestHigh;
+      ctx.InvalidationLevel = ctx.H1_Pivot2_Price; // most recent swing low
+   }
+   else // BEAR
+   {
+      // For bearish divergence: find the lowest swing low between Pivot1 and Pivot2
+      // That low is the support level price must close below to confirm CHoCH
+      int    swLowIdx[];
+      double swLowPrc[];
+      int cnt = FindPivots(ctx.Symbol, PERIOD_H1, -1, InpPivotBars,
+                           searchBars, 20, swLowIdx, swLowPrc);
+
+      double bestLow = 0.0;
+      bool   found   = false;
+      for(int i = 0; i < cnt; i++)
+      {
+         if(swLowIdx[i] >= p2Bar && swLowIdx[i] <= p1Bar)
+         {
+            if(!found || swLowPrc[i] < bestLow)
+            {
+               bestLow = swLowPrc[i];
+               found   = true;
+            }
+         }
+      }
+      // Fallback
+      if(!found && cnt > 0)
+         bestLow = swLowPrc[0];
+
+      ctx.TriggerLevel      = bestLow;
+      ctx.InvalidationLevel = ctx.H1_Pivot2_Price; // most recent swing high
+   }
+
+   // Record the time of the last closed H1 bar as the start of the CHoCH wait
+   sd.CHoCH_WaitStartBarTime = iTime(ctx.Symbol, PERIOD_H1, 1);
+
+   Print(ctx.Symbol, " CHoCH setup: Bias=", ctx.Bias,
+         " Trigger=", DoubleToString(ctx.TriggerLevel, ctx.Digits),
+         " Invalidation=", DoubleToString(ctx.InvalidationLevel, ctx.Digits));
+}
+
+//+------------------------------------------------------------------+
+//|  Check for CHoCH confirmation on the last closed H1 bar           |
+//|  Called every new H1 bar while state == STATE_WAIT_CHOCH.         |
+//|  Returns true when CHoCH is confirmed → transitions to            |
+//|  STATE_WAIT_RETEST. Returns false on reject or still waiting.     |
+//+------------------------------------------------------------------+
+bool CheckCHoCH(SSymbolData &sd)
+{
+   SSignalContext &ctx = sd.Ctx;
+
+   // --- Timeout: reject if too many H1 bars have elapsed ---
+   int barsElapsed = iBarShift(ctx.Symbol, PERIOD_H1, sd.CHoCH_WaitStartBarTime, false);
+   if(barsElapsed > InpCHoCHTimeout)
+   {
+      ctx.ReasonCode = "REJECT_NO_CHOCH";
+      ctx.ReasonText = "CHoCH not confirmed within " + IntegerToString(InpCHoCHTimeout) + " bars";
+      WriteCSVRow("REJECT", ctx);
+      int prevID = ctx.SignalID;
+      ResetContext(ctx, ctx.Symbol);
+      ctx.SignalID = prevID;
+      sd.State = STATE_SCAN_DIV;
+      return false;
+   }
+
+   // --- Get last closed H1 candle (bar index 1) ---
+   double closeBar1 = iClose(ctx.Symbol, PERIOD_H1, 1);
+   double openBar1  = iOpen(ctx.Symbol,  PERIOD_H1, 1);
+   double highBar1  = iHigh(ctx.Symbol,  PERIOD_H1, 1);
+   double lowBar1   = iLow(ctx.Symbol,   PERIOD_H1, 1);
+
+   // --- Invalidation: if price closes beyond the divergence pivot, signal is void ---
+   if(ctx.Bias == "BULL" && closeBar1 < ctx.InvalidationLevel)
+   {
+      ctx.ReasonCode = "REJECT_NO_CHOCH";
+      ctx.ReasonText = "Invalidated: BULL close " + DoubleToString(closeBar1, ctx.Digits) +
+                       " < invalidation " + DoubleToString(ctx.InvalidationLevel, ctx.Digits);
+      WriteCSVRow("REJECT", ctx);
+      int prevID = ctx.SignalID;
+      ResetContext(ctx, ctx.Symbol);
+      ctx.SignalID = prevID;
+      sd.State = STATE_SCAN_DIV;
+      return false;
+   }
+   if(ctx.Bias == "BEAR" && closeBar1 > ctx.InvalidationLevel)
+   {
+      ctx.ReasonCode = "REJECT_NO_CHOCH";
+      ctx.ReasonText = "Invalidated: BEAR close " + DoubleToString(closeBar1, ctx.Digits) +
+                       " > invalidation " + DoubleToString(ctx.InvalidationLevel, ctx.Digits);
+      WriteCSVRow("REJECT", ctx);
+      int prevID = ctx.SignalID;
+      ResetContext(ctx, ctx.Symbol);
+      ctx.SignalID = prevID;
+      sd.State = STATE_SCAN_DIV;
+      return false;
+   }
+
+   // --- Strictness checks ---
+   // Tolerance beyond CHoCH level (fraction of stored ATR)
+   double tolerance = InpCHoCHTolATR * ctx.ATR_H1;
+
+   // Body/range ratio: ensures momentum candle, not a wick-dominated bar
+   double range  = highBar1 - lowBar1;
+   double body   = MathAbs(closeBar1 - openBar1);
+   bool   bodyOK = (range > 0.0 && (body / range) >= InpCHoCHMinBody);
+
+   // Guard: if TriggerLevel was not set, skip confirmation attempt
+   if(ctx.TriggerLevel <= 0.0) return false;
+
+   // --- CHoCH confirmation ---
+   if(ctx.Bias == "BULL")
+   {
+      if(closeBar1 > ctx.TriggerLevel + tolerance && bodyOK)
+      {
+         ctx.H1_CHoCH_Time  = iTime(ctx.Symbol, PERIOD_H1, 1);
+         ctx.H1_CHoCH_Close = closeBar1;
+         ctx.Notes = ctx.Notes + " | CHoCH_BULL @" + DoubleToString(closeBar1, ctx.Digits);
+         WriteCSVRow("SIGNAL", ctx);
+         Print(ctx.Symbol, " CHoCH confirmed (BULL): close=", DoubleToString(closeBar1, ctx.Digits),
+               " > trigger=", DoubleToString(ctx.TriggerLevel, ctx.Digits));
+         sd.State = STATE_WAIT_RETEST;
+         return true;
+      }
+   }
+   else if(ctx.Bias == "BEAR")
+   {
+      if(closeBar1 < ctx.TriggerLevel - tolerance && bodyOK)
+      {
+         ctx.H1_CHoCH_Time  = iTime(ctx.Symbol, PERIOD_H1, 1);
+         ctx.H1_CHoCH_Close = closeBar1;
+         ctx.Notes = ctx.Notes + " | CHoCH_BEAR @" + DoubleToString(closeBar1, ctx.Digits);
+         WriteCSVRow("SIGNAL", ctx);
+         Print(ctx.Symbol, " CHoCH confirmed (BEAR): close=", DoubleToString(closeBar1, ctx.Digits),
+               " < trigger=", DoubleToString(ctx.TriggerLevel, ctx.Digits));
+         sd.State = STATE_WAIT_RETEST;
+         return true;
+      }
+   }
+
+   return false; // Still waiting for CHoCH
+}
+
+//+------------------------------------------------------------------+
 //|  Build dashboard comment string for all symbols                   |
 //+------------------------------------------------------------------+
 void UpdateDashboard()
@@ -759,6 +952,22 @@ void UpdateDashboard()
          if(sd.Ctx.RegimeReject)
             dash += " | REGIME_REJECT";
       }
+      // CHoCH watch info while waiting
+      if(sd.State == STATE_WAIT_CHOCH && sd.Ctx.TriggerLevel > 0.0)
+      {
+         int barsElapsed = iBarShift(sd.Symbol, PERIOD_H1, sd.CHoCH_WaitStartBarTime, false);
+         int barsRemain  = InpCHoCHTimeout - barsElapsed;
+         if(barsRemain < 0) barsRemain = 0;
+         dash += " | CHoCH@" + DoubleToString(sd.Ctx.TriggerLevel, sd.Ctx.Digits);
+         dash += " | Inv@"   + DoubleToString(sd.Ctx.InvalidationLevel, sd.Ctx.Digits);
+         dash += " | " + IntegerToString(barsRemain) + " bars left";
+      }
+      // Show confirmed CHoCH info in downstream states
+      if((sd.State == STATE_WAIT_RETEST || sd.State == STATE_WAIT_MICROBOS ||
+          sd.State == STATE_READY_ENTRY) && sd.Ctx.H1_CHoCH_Time > 0)
+      {
+         dash += " | CHoCH_OK@" + DoubleToString(sd.Ctx.H1_CHoCH_Close, sd.Ctx.Digits);
+      }
       dash += "\n";
    }
    Comment(dash);
@@ -782,12 +991,17 @@ void ProcessSymbol(int idx)
 
       if(DetectH1Divergence(sd))
       {
-         // Divergence confirmed — advance to wait for CHoCH
+         // Divergence confirmed — advance to wait for CHoCH and setup levels
          sd.State = STATE_WAIT_CHOCH;
+         SetupCHoCHLevels(sd);
       }
       // If not confirmed, remain in STATE_SCAN_DIV
    }
-   // Future stages (CHoCH, M5 Retest, Micro-BOS, Entry) are placeholders
+   else if(sd.State == STATE_WAIT_CHOCH)
+   {
+      CheckCHoCH(sd);
+   }
+   // Future stages (M5 Retest, Micro-BOS, Entry) are placeholders
    // for subsequent development iterations per the CONTRIBUTING single-change rule
 }
 
@@ -827,6 +1041,7 @@ int OnInit()
       sd.State        = STATE_SCAN_DIV;
       sd.LastBarTimeH1= 0;
       sd.LastBarTimeM5= 0;
+      sd.CHoCH_WaitStartBarTime = 0;
 
       // Initialize indicator handles
       sd.hRSI_H1 = INVALID_HANDLE;

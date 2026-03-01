@@ -1,0 +1,911 @@
+//+------------------------------------------------------------------+
+//|  AWRAFX_TrendDiv_EA.mq5                                          |
+//|  Version : 1.0.0                                                 |
+//|  Author  : AWRAFX                                                |
+//|  Description: H1 Trendline Divergence Breakout Expert Advisor    |
+//|               Stages: H1 Divergence → CHoCH → M5 Retest/Reclaim |
+//|               → M5 Micro-BOS → Entry/Score → KPI                |
+//+------------------------------------------------------------------+
+#property copyright "AWRAFX"
+#property link      ""
+#property version   "1.00"
+#property strict
+
+//--- Input Parameters
+input string   InpSymbols        = "XAUUSD";   // Comma-separated symbols
+input int      InpRSI_Period     = 14;          // RSI Period
+input int      InpEMA_Period     = 200;         // EMA Period
+input int      InpATR_Period     = 14;          // ATR Period
+input int      InpPivotBars      = 5;           // Bars each side for pivot
+input double   InpMinRSIDelta    = 3.0;         // Min RSI delta for divergence
+input int      InpMinDivSpan     = 5;           // Min bars between pivots
+input int      InpMaxDivSpan     = 50;          // Max bars between pivots
+input double   InpTrendATRMult   = 2.0;         // ATR multiplier for trend strength
+input int      InpMinScore       = 60;          // Minimum score for signal
+input double   InpMaxSpread      = 50;          // Max spread in points
+input bool     InpWriteCSV       = true;        // Write audit CSV
+
+//--- Signal State Machine
+enum ESignalState
+{
+   STATE_SCAN_DIV,      // Scanning for H1 divergence
+   STATE_WAIT_CHOCH,    // Waiting for CHoCH confirmation
+   STATE_WAIT_RETEST,   // Waiting for M5 retest/reclaim
+   STATE_WAIT_MICROBOS, // Waiting for M5 micro-BOS
+   STATE_READY_ENTRY,   // Entry criteria met
+   STATE_IDLE           // Idle / paused
+};
+
+//--- Divergence type
+enum EDivType
+{
+   DIV_NONE,
+   DIV_REG_BULL,   // Regular Bullish: price LL, RSI HL
+   DIV_REG_BEAR,   // Regular Bearish: price HH, RSI LH
+   DIV_HID_BULL,   // Hidden Bullish:  price HL, RSI LL
+   DIV_HID_BEAR    // Hidden Bearish:  price LH, RSI HH
+};
+
+//--- Per-symbol signal context (all traceability fields)
+struct SSignalContext
+{
+   // Identity
+   string         Symbol;
+   string         Bias;           // BULL or BEAR
+   int            Digits;
+   double         Point;
+   int            SignalID;
+
+   // H1 Divergence
+   EDivType       DivType;
+   datetime       H1_Pivot1_Time;
+   double         H1_Pivot1_Price;
+   double         H1_Pivot1_RSI;
+   datetime       H1_Pivot2_Time;
+   double         H1_Pivot2_Price;
+   double         H1_Pivot2_RSI;
+   double         H1_Div_RSIDelta;
+   int            H1_Div_SpanBars;
+
+   // CHoCH
+   datetime       H1_CHoCH_Time;
+   double         H1_CHoCH_Close;
+   double         TriggerLevel;
+   double         InvalidationLevel;
+
+   // Regime
+   double         EMA200_H1;
+   double         ATR_H1;
+   bool           TrendStrongFlag;
+   bool           RegimeReject;
+
+   // M5
+   datetime       M5_Touch_Time;
+   datetime       M5_Reclaim_Time;
+   double         M5_MicroLevel;
+   datetime       M5_MicroBOS_Time;
+
+   // Entry
+   datetime       Entry_Time;
+   double         Entry_Price;
+
+   // Score
+   double         Score_Total;
+   int            MinScore;
+   double         Score_DivStrength;
+   double         Score_PivotSignificance;
+   double         Score_RegimeQuality;
+   double         Score_RoomToMove;
+
+   // KPI
+   int            KPI_LookaheadBarsM5;
+   string         Result;
+   double         MAE_R;
+   double         MFE_R;
+
+   // Meta
+   double         Spread_Points;
+   double         Tol_Price;
+   string         Notes;
+   string         ReasonCode;
+   string         ReasonText;
+};
+
+//--- Per-symbol runtime data
+struct SSymbolData
+{
+   string         Symbol;
+   ESignalState   State;
+   datetime       LastBarTimeH1;
+   datetime       LastBarTimeM5;
+
+   // Indicator handles — H1
+   int            hRSI_H1;
+   int            hEMA_H1;
+   int            hATR_H1;
+
+   // Indicator handles — M5
+   int            hRSI_M5;
+   int            hEMA_M5;
+   int            hATR_M5;
+
+   // Current signal context
+   SSignalContext Ctx;
+};
+
+//--- Globals
+SSymbolData  g_Symbols[];          // Array of symbol data
+int          g_SymbolCount  = 0;   // Number of active symbols
+string       g_RunID        = "";  // EA start timestamp as string
+int          g_CSVHandle    = INVALID_HANDLE; // CSV file handle
+
+//--- CSV header (locked per TRACEABILITY_RULES.md)
+const string CSV_HEADER =
+   "RowType,RunID,SignalID,Symbol,Bias,Digits,Point,"
+   "DivType,"
+   "H1_Pivot1_Time,H1_Pivot1_Price,H1_Pivot1_RSI,"
+   "H1_Pivot2_Time,H1_Pivot2_Price,H1_Pivot2_RSI,"
+   "H1_Div_RSIDelta,H1_Div_SpanBars,"
+   "H1_CHoCH_Time,H1_CHoCH_Close,TriggerLevel,InvalidationLevel,"
+   "EMA200_H1,ATR_H1,TrendStrongFlag,RegimeReject,"
+   "M5_Touch_Time,M5_Reclaim_Time,M5_MicroLevel,M5_MicroBOS_Time,"
+   "Entry_Time,Entry_Price,"
+   "Score_Total,MinScore,Score_DivStrength,Score_PivotSignificance,"
+   "Score_RegimeQuality,Score_RoomToMove,"
+   "KPI_LookaheadBarsM5,Result,MAE_R,MFE_R,"
+   "Spread_Points,Tol_Price,Notes,ReasonCode,ReasonText";
+
+//+------------------------------------------------------------------+
+//|  Helper: convert bool to "1"/"0"                                 |
+//+------------------------------------------------------------------+
+string BoolToStr(bool v) { return v ? "1" : "0"; }
+
+//+------------------------------------------------------------------+
+//|  Helper: convert EDivType to string                              |
+//+------------------------------------------------------------------+
+string DivTypeToStr(EDivType dt)
+{
+   switch(dt)
+   {
+      case DIV_REG_BULL: return "REG_BULL";
+      case DIV_REG_BEAR: return "REG_BEAR";
+      case DIV_HID_BULL: return "HID_BULL";
+      case DIV_HID_BEAR: return "HID_BEAR";
+      default:           return "NONE";
+   }
+}
+
+//+------------------------------------------------------------------+
+//|  Parse comma-separated symbol string                             |
+//+------------------------------------------------------------------+
+int ParseSymbols(const string raw, string &out[])
+{
+   string tmp = raw;
+   StringTrimRight(tmp);
+   StringTrimLeft(tmp);
+   int cnt = StringSplit(tmp, ',', out);
+   for(int i = 0; i < cnt; i++)
+   {
+      StringTrimLeft(out[i]);
+      StringTrimRight(out[i]);
+   }
+   return cnt;
+}
+
+//+------------------------------------------------------------------+
+//|  Initialize indicator handles for one symbol                     |
+//+------------------------------------------------------------------+
+bool InitHandles(SSymbolData &sd)
+{
+   sd.hRSI_H1 = iRSI(sd.Symbol, PERIOD_H1, InpRSI_Period, PRICE_CLOSE);
+   sd.hEMA_H1 = iMA(sd.Symbol,  PERIOD_H1, InpEMA_Period,  0, MODE_EMA, PRICE_CLOSE);
+   sd.hATR_H1 = iATR(sd.Symbol, PERIOD_H1, InpATR_Period);
+   sd.hRSI_M5 = iRSI(sd.Symbol, PERIOD_M5, InpRSI_Period, PRICE_CLOSE);
+   sd.hEMA_M5 = iMA(sd.Symbol,  PERIOD_M5, InpEMA_Period,  0, MODE_EMA, PRICE_CLOSE);
+   sd.hATR_M5 = iATR(sd.Symbol, PERIOD_M5, InpATR_Period);
+
+   if(sd.hRSI_H1 == INVALID_HANDLE || sd.hEMA_H1 == INVALID_HANDLE ||
+      sd.hATR_H1 == INVALID_HANDLE || sd.hRSI_M5 == INVALID_HANDLE ||
+      sd.hEMA_M5 == INVALID_HANDLE || sd.hATR_M5 == INVALID_HANDLE)
+   {
+      Print("ERROR: Failed to create indicator handles for ", sd.Symbol);
+      return false;
+   }
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//|  Release indicator handles for one symbol                        |
+//+------------------------------------------------------------------+
+void ReleaseHandles(SSymbolData &sd)
+{
+   if(sd.hRSI_H1 != INVALID_HANDLE) { IndicatorRelease(sd.hRSI_H1); sd.hRSI_H1 = INVALID_HANDLE; }
+   if(sd.hEMA_H1 != INVALID_HANDLE) { IndicatorRelease(sd.hEMA_H1); sd.hEMA_H1 = INVALID_HANDLE; }
+   if(sd.hATR_H1 != INVALID_HANDLE) { IndicatorRelease(sd.hATR_H1); sd.hATR_H1 = INVALID_HANDLE; }
+   if(sd.hRSI_M5 != INVALID_HANDLE) { IndicatorRelease(sd.hRSI_M5); sd.hRSI_M5 = INVALID_HANDLE; }
+   if(sd.hEMA_M5 != INVALID_HANDLE) { IndicatorRelease(sd.hEMA_M5); sd.hEMA_M5 = INVALID_HANDLE; }
+   if(sd.hATR_M5 != INVALID_HANDLE) { IndicatorRelease(sd.hATR_M5); sd.hATR_M5 = INVALID_HANDLE; }
+}
+
+//+------------------------------------------------------------------+
+//|  Initialize the CSV file (write header if new file)             |
+//+------------------------------------------------------------------+
+bool InitCSV()
+{
+   if(!InpWriteCSV) return true;
+
+   // Try to open existing file for append
+   g_CSVHandle = FileOpen("FinalSpec_Audit.csv",
+                          FILE_READ | FILE_WRITE | FILE_CSV | FILE_SHARE_READ);
+   if(g_CSVHandle == INVALID_HANDLE)
+   {
+      // Create new file
+      g_CSVHandle = FileOpen("FinalSpec_Audit.csv",
+                             FILE_WRITE | FILE_CSV | FILE_SHARE_READ);
+      if(g_CSVHandle == INVALID_HANDLE)
+      {
+         Print("ERROR: Cannot create FinalSpec_Audit.csv, error ", GetLastError());
+         return false;
+      }
+      // Write header to brand new file
+      FileWrite(g_CSVHandle, CSV_HEADER);
+   }
+   else
+   {
+      // File exists — seek to end for appending
+      FileSeek(g_CSVHandle, 0, SEEK_END);
+   }
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//|  Write a CSV row (SIGNAL or REJECT)                              |
+//+------------------------------------------------------------------+
+void WriteCSVRow(const string rowType, const SSignalContext &ctx)
+{
+   if(!InpWriteCSV || g_CSVHandle == INVALID_HANDLE) return;
+
+   string line =
+      rowType                                              + "," +
+      g_RunID                                             + "," +
+      IntegerToString(ctx.SignalID)                       + "," +
+      ctx.Symbol                                          + "," +
+      ctx.Bias                                            + "," +
+      IntegerToString(ctx.Digits)                         + "," +
+      DoubleToString(ctx.Point, 10)                       + "," +
+      DivTypeToStr(ctx.DivType)                           + "," +
+      TimeToString(ctx.H1_Pivot1_Time, TIME_DATE|TIME_MINUTES) + "," +
+      DoubleToString(ctx.H1_Pivot1_Price, ctx.Digits)     + "," +
+      DoubleToString(ctx.H1_Pivot1_RSI,  2)               + "," +
+      TimeToString(ctx.H1_Pivot2_Time, TIME_DATE|TIME_MINUTES) + "," +
+      DoubleToString(ctx.H1_Pivot2_Price, ctx.Digits)     + "," +
+      DoubleToString(ctx.H1_Pivot2_RSI,  2)               + "," +
+      DoubleToString(ctx.H1_Div_RSIDelta, 2)              + "," +
+      IntegerToString(ctx.H1_Div_SpanBars)                + "," +
+      TimeToString(ctx.H1_CHoCH_Time, TIME_DATE|TIME_MINUTES) + "," +
+      DoubleToString(ctx.H1_CHoCH_Close, ctx.Digits)      + "," +
+      DoubleToString(ctx.TriggerLevel,   ctx.Digits)      + "," +
+      DoubleToString(ctx.InvalidationLevel, ctx.Digits)   + "," +
+      DoubleToString(ctx.EMA200_H1, ctx.Digits)           + "," +
+      DoubleToString(ctx.ATR_H1, ctx.Digits)              + "," +
+      BoolToStr(ctx.TrendStrongFlag)                      + "," +
+      BoolToStr(ctx.RegimeReject)                         + "," +
+      TimeToString(ctx.M5_Touch_Time, TIME_DATE|TIME_MINUTES) + "," +
+      TimeToString(ctx.M5_Reclaim_Time, TIME_DATE|TIME_MINUTES) + "," +
+      DoubleToString(ctx.M5_MicroLevel, ctx.Digits)       + "," +
+      TimeToString(ctx.M5_MicroBOS_Time, TIME_DATE|TIME_MINUTES) + "," +
+      TimeToString(ctx.Entry_Time, TIME_DATE|TIME_MINUTES) + "," +
+      DoubleToString(ctx.Entry_Price, ctx.Digits)          + "," +
+      DoubleToString(ctx.Score_Total, 2)                   + "," +
+      IntegerToString(ctx.MinScore)                        + "," +
+      DoubleToString(ctx.Score_DivStrength,      2)        + "," +
+      DoubleToString(ctx.Score_PivotSignificance,2)        + "," +
+      DoubleToString(ctx.Score_RegimeQuality,    2)        + "," +
+      DoubleToString(ctx.Score_RoomToMove,       2)        + "," +
+      IntegerToString(ctx.KPI_LookaheadBarsM5)             + "," +
+      ctx.Result                                           + "," +
+      DoubleToString(ctx.MAE_R, 4)                         + "," +
+      DoubleToString(ctx.MFE_R, 4)                         + "," +
+      DoubleToString(ctx.Spread_Points, 1)                 + "," +
+      DoubleToString(ctx.Tol_Price, ctx.Digits)            + "," +
+      ctx.Notes                                            + "," +
+      ctx.ReasonCode                                       + "," +
+      ctx.ReasonText;
+
+   FileWrite(g_CSVHandle, line);
+   FileFlush(g_CSVHandle);
+}
+
+//+------------------------------------------------------------------+
+//|  Reset a signal context to empty/default values                  |
+//+------------------------------------------------------------------+
+void ResetContext(SSignalContext &ctx, const string symbol)
+{
+   ctx.Symbol           = symbol;
+   ctx.Bias             = "";
+   ctx.Digits           = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   ctx.Point            = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   ctx.DivType          = DIV_NONE;
+   ctx.H1_Pivot1_Time   = 0;
+   ctx.H1_Pivot1_Price  = 0;
+   ctx.H1_Pivot1_RSI    = 0;
+   ctx.H1_Pivot2_Time   = 0;
+   ctx.H1_Pivot2_Price  = 0;
+   ctx.H1_Pivot2_RSI    = 0;
+   ctx.H1_Div_RSIDelta  = 0;
+   ctx.H1_Div_SpanBars  = 0;
+   ctx.H1_CHoCH_Time    = 0;
+   ctx.H1_CHoCH_Close   = 0;
+   ctx.TriggerLevel     = 0;
+   ctx.InvalidationLevel= 0;
+   ctx.EMA200_H1        = 0;
+   ctx.ATR_H1           = 0;
+   ctx.TrendStrongFlag  = false;
+   ctx.RegimeReject     = false;
+   ctx.M5_Touch_Time    = 0;
+   ctx.M5_Reclaim_Time  = 0;
+   ctx.M5_MicroLevel    = 0;
+   ctx.M5_MicroBOS_Time = 0;
+   ctx.Entry_Time       = 0;
+   ctx.Entry_Price      = 0;
+   ctx.Score_Total      = 0;
+   ctx.MinScore         = InpMinScore;
+   ctx.Score_DivStrength      = 0;
+   ctx.Score_PivotSignificance= 0;
+   ctx.Score_RegimeQuality    = 0;
+   ctx.Score_RoomToMove       = 0;
+   ctx.KPI_LookaheadBarsM5    = 0;
+   ctx.Result           = "";
+   ctx.MAE_R            = 0;
+   ctx.MFE_R            = 0;
+   ctx.Spread_Points    = 0;
+   ctx.Tol_Price        = 0;
+   ctx.Notes            = "";
+   ctx.ReasonCode       = "";
+   ctx.ReasonText       = "";
+}
+
+//+------------------------------------------------------------------+
+//|  Get a single indicator buffer value (index from current bar)    |
+//+------------------------------------------------------------------+
+double GetIndicatorValue(int handle, int shift)
+{
+   double buf[];
+   ArraySetAsSeries(buf, true);
+   if(CopyBuffer(handle, 0, shift, 1, buf) <= 0) return EMPTY_VALUE;
+   return buf[0];
+}
+
+//+------------------------------------------------------------------+
+//|  Detect swing pivots on H1 using ZigZag-style logic              |
+//|  Returns up to maxPivots pivot bars (index 0 = most recent)      |
+//|  pivotType: 1 = swing high, -1 = swing low                      |
+//+------------------------------------------------------------------+
+int FindPivots(const string symbol,
+               ENUM_TIMEFRAMES tf,
+               int pivotType,
+               int barsEachSide,
+               int lookback,
+               int maxPivots,
+               int &pivotBarIdx[],
+               double &pivotPrice[])
+{
+   int found = 0;
+   ArrayResize(pivotBarIdx, maxPivots);
+   ArrayResize(pivotPrice,  maxPivots);
+
+   // We need barsEachSide on both sides, start from barsEachSide
+   int startBar = barsEachSide;
+   int endBar   = lookback - barsEachSide - 1;
+   if(endBar < startBar) return 0;
+
+   for(int b = startBar; b <= endBar && found < maxPivots; b++)
+   {
+      double centerHigh = iHigh(symbol, tf, b);
+      double centerLow  = iLow(symbol,  tf, b);
+      bool   isPivot    = true;
+
+      if(pivotType == 1) // Swing High: all bars on each side must be lower
+      {
+         for(int k = 1; k <= barsEachSide && isPivot; k++)
+         {
+            if(iHigh(symbol, tf, b - k) >= centerHigh) isPivot = false;
+            if(iHigh(symbol, tf, b + k) >= centerHigh) isPivot = false;
+         }
+         if(isPivot)
+         {
+            pivotBarIdx[found] = b;
+            pivotPrice[found]  = centerHigh;
+            found++;
+         }
+      }
+      else // Swing Low: all bars on each side must be higher
+      {
+         for(int k = 1; k <= barsEachSide && isPivot; k++)
+         {
+            if(iLow(symbol, tf, b - k) <= centerLow) isPivot = false;
+            if(iLow(symbol, tf, b + k) <= centerLow) isPivot = false;
+         }
+         if(isPivot)
+         {
+            pivotBarIdx[found] = b;
+            pivotPrice[found]  = centerLow;
+            found++;
+         }
+      }
+   }
+   return found;
+}
+
+//+------------------------------------------------------------------+
+//|  Score: DivStrength based on RSI delta (max 25)                  |
+//+------------------------------------------------------------------+
+double ScoreDivStrength(double rsiDelta)
+{
+   // Map 0..30 RSI delta to 0..25 score (linear, capped)
+   double score = (rsiDelta / 30.0) * 25.0;
+   if(score > 25.0) score = 25.0;
+   if(score <  0.0) score =  0.0;
+   return score;
+}
+
+//+------------------------------------------------------------------+
+//|  Score: PivotSignificance based on swing depth vs ATR (max 25)   |
+//+------------------------------------------------------------------+
+double ScorePivotSignificance(double swingDepth, double atr)
+{
+   if(atr <= 0.0) return 0.0;
+   double ratio = swingDepth / atr;
+   // >= 3 ATRs = full score
+   double score = (ratio / 3.0) * 25.0;
+   if(score > 25.0) score = 25.0;
+   if(score <  0.0) score =  0.0;
+   return score;
+}
+
+//+------------------------------------------------------------------+
+//|  Score: RegimeQuality — price near EMA = good (max 25)           |
+//+------------------------------------------------------------------+
+double ScoreRegimeQuality(double price, double ema200, double atr)
+{
+   if(atr <= 0.0) return 12.5; // neutral if ATR unavailable
+   double dist = MathAbs(price - ema200) / atr;
+   // Close to EMA (within 1 ATR) = max score; far away = lower score
+   double score = 25.0 - (dist / 5.0) * 25.0;
+   if(score > 25.0) score = 25.0;
+   if(score <  0.0) score =  0.0;
+   return score;
+}
+
+//+------------------------------------------------------------------+
+//|  Score: RoomToMove — stub returning neutral 12.5 (max 25)        |
+//|  Full implementation requires next structure level detection      |
+//|  which is part of later pipeline stages.                         |
+//+------------------------------------------------------------------+
+double ScoreRoomToMove()
+{
+   return 12.5; // placeholder neutral value
+}
+
+//+------------------------------------------------------------------+
+//|  Core: Stage 1 — Detect H1 Divergence for one symbol             |
+//|  Returns true if a valid divergence was found and passes filters  |
+//+------------------------------------------------------------------+
+bool DetectH1Divergence(SSymbolData &sd)
+{
+   SSignalContext &ctx = sd.Ctx;
+
+   // --- Retrieve regime data (EMA200 and ATR on H1) ---
+   double ema200 = GetIndicatorValue(sd.hEMA_H1, 1);
+   double atr    = GetIndicatorValue(sd.hATR_H1, 1);
+
+   if(ema200 == EMPTY_VALUE || atr == EMPTY_VALUE)
+   {
+      Print(ctx.Symbol, ": Regime indicators not ready");
+      return false;
+   }
+
+   ctx.EMA200_H1 = ema200;
+   ctx.ATR_H1    = atr;
+
+   // Current close price on H1
+   double closeNow = iClose(ctx.Symbol, PERIOD_H1, 1);
+
+   // Determine TrendStrongFlag
+   double distFromEMA = MathAbs(closeNow - ema200);
+   ctx.TrendStrongFlag = (distFromEMA > InpTrendATRMult * atr);
+
+   // --- Need enough bars for pivot detection ---
+   int lookback = InpMaxDivSpan + InpPivotBars * 2 + 5;
+   int barsAvail = Bars(ctx.Symbol, PERIOD_H1);
+   if(barsAvail < lookback)
+   {
+      Print(ctx.Symbol, ": Not enough H1 bars (", barsAvail, " < ", lookback, ")");
+      return false;
+   }
+
+   // --- Read RSI buffer ---
+   double rsiBuffer[];
+   ArraySetAsSeries(rsiBuffer, true);
+   int rsiCopied = CopyBuffer(sd.hRSI_H1, 0, 0, lookback, rsiBuffer);
+   if(rsiCopied < lookback)
+   {
+      Print(ctx.Symbol, ": RSI buffer not ready");
+      return false;
+   }
+
+   // --- Find two most recent swing lows (for bullish divergence types) ---
+   int   swLowIdx[];
+   double swLowPrc[];
+   int swLowCount = FindPivots(ctx.Symbol, PERIOD_H1, -1,
+                                InpPivotBars, lookback,
+                                2, swLowIdx, swLowPrc);
+
+   // --- Find two most recent swing highs (for bearish divergence types) ---
+   int   swHighIdx[];
+   double swHighPrc[];
+   int swHighCount = FindPivots(ctx.Symbol, PERIOD_H1, 1,
+                                 InpPivotBars, lookback,
+                                 2, swHighIdx, swHighPrc);
+
+   // --- Check all four divergence types ---
+   EDivType divFound   = DIV_NONE;
+   int      p1BarIdx   = 0, p2BarIdx = 0;
+   double   p1Price    = 0, p2Price  = 0;
+
+   // ---- Regular Bullish: Price LL, RSI HL ----
+   if(swLowCount >= 2)
+   {
+      int   i1 = swLowIdx[0], i2 = swLowIdx[1]; // i1 = more recent
+      double prc1 = swLowPrc[0], prc2 = swLowPrc[1];
+      double rsi1 = rsiBuffer[i1], rsi2 = rsiBuffer[i2];
+      int    span = i2 - i1; // bars between pivots (i2 is older, larger index)
+
+      if(span >= InpMinDivSpan && span <= InpMaxDivSpan)
+      {
+         if(prc1 < prc2 &&               // Price: lower low
+            rsi1 > rsi2 &&               // RSI: higher low
+            (rsi1 - rsi2) >= InpMinRSIDelta)
+         {
+            divFound = DIV_REG_BULL;
+            p1BarIdx = i2; p2BarIdx = i1; // p1 = older pivot
+            p1Price  = prc2; p2Price = prc1;
+         }
+      }
+   }
+
+   // ---- Regular Bearish: Price HH, RSI LH ----
+   if(divFound == DIV_NONE && swHighCount >= 2)
+   {
+      int   i1 = swHighIdx[0], i2 = swHighIdx[1];
+      double prc1 = swHighPrc[0], prc2 = swHighPrc[1];
+      double rsi1 = rsiBuffer[i1], rsi2 = rsiBuffer[i2];
+      int    span = i2 - i1;
+
+      if(span >= InpMinDivSpan && span <= InpMaxDivSpan)
+      {
+         if(prc1 > prc2 &&               // Price: higher high
+            rsi1 < rsi2 &&               // RSI: lower high
+            (rsi2 - rsi1) >= InpMinRSIDelta)
+         {
+            divFound = DIV_REG_BEAR;
+            p1BarIdx = i2; p2BarIdx = i1;
+            p1Price  = prc2; p2Price = prc1;
+         }
+      }
+   }
+
+   // ---- Hidden Bullish: Price HL, RSI LL ----
+   if(divFound == DIV_NONE && swLowCount >= 2)
+   {
+      int   i1 = swLowIdx[0], i2 = swLowIdx[1];
+      double prc1 = swLowPrc[0], prc2 = swLowPrc[1];
+      double rsi1 = rsiBuffer[i1], rsi2 = rsiBuffer[i2];
+      int    span = i2 - i1;
+
+      if(span >= InpMinDivSpan && span <= InpMaxDivSpan)
+      {
+         if(prc1 > prc2 &&               // Price: higher low (HL)
+            rsi1 < rsi2 &&               // RSI: lower low (LL)
+            (rsi2 - rsi1) >= InpMinRSIDelta)
+         {
+            divFound = DIV_HID_BULL;
+            p1BarIdx = i2; p2BarIdx = i1;
+            p1Price  = prc2; p2Price = prc1;
+         }
+      }
+   }
+
+   // ---- Hidden Bearish: Price LH, RSI HH ----
+   if(divFound == DIV_NONE && swHighCount >= 2)
+   {
+      int   i1 = swHighIdx[0], i2 = swHighIdx[1];
+      double prc1 = swHighPrc[0], prc2 = swHighPrc[1];
+      double rsi1 = rsiBuffer[i1], rsi2 = rsiBuffer[i2];
+      int    span = i2 - i1;
+
+      if(span >= InpMinDivSpan && span <= InpMaxDivSpan)
+      {
+         if(prc1 < prc2 &&               // Price: lower high (LH)
+            rsi1 > rsi2 &&               // RSI: higher high (HH)
+            (rsi1 - rsi2) >= InpMinRSIDelta)
+         {
+            divFound = DIV_HID_BEAR;
+            p1BarIdx = i2; p2BarIdx = i1;
+            p1Price  = prc2; p2Price = prc1;
+         }
+      }
+   }
+
+   // --- No divergence found ---
+   if(divFound == DIV_NONE)
+   {
+      ctx.ReasonCode = "REJECT_NO_DIVERGENCE";
+      ctx.ReasonText = "No qualifying divergence pattern found on H1";
+      WriteCSVRow("REJECT", ctx);
+      return false;
+   }
+
+   // --- Populate divergence fields in context ---
+   ctx.DivType         = divFound;
+   ctx.Bias            = (divFound == DIV_REG_BULL || divFound == DIV_HID_BULL) ? "BULL" : "BEAR";
+   ctx.H1_Pivot1_Time  = iTime(ctx.Symbol, PERIOD_H1, p1BarIdx);
+   ctx.H1_Pivot1_Price = p1Price;
+   ctx.H1_Pivot1_RSI   = rsiBuffer[p1BarIdx];
+   ctx.H1_Pivot2_Time  = iTime(ctx.Symbol, PERIOD_H1, p2BarIdx);
+   ctx.H1_Pivot2_Price = p2Price;
+   ctx.H1_Pivot2_RSI   = rsiBuffer[p2BarIdx];
+   ctx.H1_Div_RSIDelta = MathAbs(ctx.H1_Pivot2_RSI - ctx.H1_Pivot1_RSI);
+   ctx.H1_Div_SpanBars = MathAbs(p2BarIdx - p1BarIdx);
+
+   // --- Spread filter ---
+   long spreadPts = SymbolInfoInteger(ctx.Symbol, SYMBOL_SPREAD);
+   ctx.Spread_Points = (double)spreadPts;
+   if(ctx.Spread_Points > InpMaxSpread)
+   {
+      ctx.ReasonCode = "REJECT_SPREAD_TOO_HIGH";
+      ctx.ReasonText = "Spread " + DoubleToString(ctx.Spread_Points, 1) +
+                       " > max " + DoubleToString(InpMaxSpread, 1);
+      WriteCSVRow("REJECT", ctx);
+      return false;
+   }
+
+   // --- Regime filter ---
+   bool isBullDiv = (ctx.Bias == "BULL");
+   if(ctx.TrendStrongFlag)
+   {
+      bool trendIsBull = (closeNow > ema200);
+      // Reject if divergence is against strong trend
+      if(isBullDiv && !trendIsBull)
+      {
+         ctx.RegimeReject = true;
+         ctx.ReasonCode   = "REJECT_REGIME_STRONG_TREND";
+         ctx.ReasonText   = "Strong bearish trend rejects bullish divergence";
+         WriteCSVRow("REJECT", ctx);
+         return false;
+      }
+      if(!isBullDiv && trendIsBull)
+      {
+         ctx.RegimeReject = true;
+         ctx.ReasonCode   = "REJECT_REGIME_STRONG_TREND";
+         ctx.ReasonText   = "Strong bullish trend rejects bearish divergence";
+         WriteCSVRow("REJECT", ctx);
+         return false;
+      }
+   }
+   ctx.RegimeReject = false;
+
+   // --- Scoring ---
+   // Swing depth for PivotSignificance: distance between the two pivot prices
+   double swingDepth = MathAbs(p1Price - p2Price);
+   ctx.Score_DivStrength       = ScoreDivStrength(ctx.H1_Div_RSIDelta);
+   ctx.Score_PivotSignificance = ScorePivotSignificance(swingDepth, atr);
+   ctx.Score_RegimeQuality     = ScoreRegimeQuality(closeNow, ema200, atr);
+   ctx.Score_RoomToMove        = ScoreRoomToMove();
+   ctx.Score_Total             = ctx.Score_DivStrength +
+                                 ctx.Score_PivotSignificance +
+                                 ctx.Score_RegimeQuality +
+                                 ctx.Score_RoomToMove;
+   ctx.MinScore                = InpMinScore;
+
+   if(ctx.Score_Total < (double)InpMinScore)
+   {
+      ctx.ReasonCode = "REJECT_SCORE_BELOW_MIN";
+      ctx.ReasonText = "Score " + DoubleToString(ctx.Score_Total, 1) +
+                       " < min " + IntegerToString(InpMinScore);
+      WriteCSVRow("REJECT", ctx);
+      return false;
+   }
+
+   // --- Divergence valid: write SIGNAL row and advance state ---
+   ctx.SignalID++;
+   WriteCSVRow("SIGNAL", ctx);
+   Print(ctx.Symbol, " [", DivTypeToStr(divFound), "] Divergence detected. "
+         "RSI delta=", DoubleToString(ctx.H1_Div_RSIDelta, 2),
+         " Score=", DoubleToString(ctx.Score_Total, 1));
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//|  Build dashboard comment string for all symbols                   |
+//+------------------------------------------------------------------+
+void UpdateDashboard()
+{
+   string dash = "=== AWRAFX TrendDiv EA ===\n";
+   dash += "RunID: " + g_RunID + "\n\n";
+
+   for(int i = 0; i < g_SymbolCount; i++)
+   {
+      SSymbolData &sd = g_Symbols[i];
+      string stateStr = "";
+      switch(sd.State)
+      {
+         case STATE_SCAN_DIV:      stateStr = "SCAN_DIV";      break;
+         case STATE_WAIT_CHOCH:    stateStr = "WAIT_CHOCH";    break;
+         case STATE_WAIT_RETEST:   stateStr = "WAIT_RETEST";   break;
+         case STATE_WAIT_MICROBOS: stateStr = "WAIT_MICROBOS"; break;
+         case STATE_READY_ENTRY:   stateStr = "READY_ENTRY";   break;
+         default:                  stateStr = "IDLE";           break;
+      }
+
+      dash += sd.Symbol + ": " + stateStr;
+      if(sd.Ctx.DivType != DIV_NONE)
+      {
+         dash += " | Div=" + DivTypeToStr(sd.Ctx.DivType);
+         dash += " | Bias=" + sd.Ctx.Bias;
+         dash += " | Score=" + DoubleToString(sd.Ctx.Score_Total, 1);
+         if(sd.Ctx.TrendStrongFlag)
+            dash += " | TrendStrong";
+         if(sd.Ctx.RegimeReject)
+            dash += " | REGIME_REJECT";
+      }
+      dash += "\n";
+   }
+   Comment(dash);
+}
+
+//+------------------------------------------------------------------+
+//|  Process one symbol on a new H1 bar                              |
+//+------------------------------------------------------------------+
+void ProcessSymbol(int idx)
+{
+   SSymbolData &sd = g_Symbols[idx];
+
+   if(sd.State == STATE_SCAN_DIV)
+   {
+      // Increment SignalID for new attempt
+      // (SignalID incremented inside DetectH1Divergence on success)
+      // Reset context fields (keep SignalID counter)
+      int prevSignalID = sd.Ctx.SignalID;
+      ResetContext(sd.Ctx, sd.Symbol);
+      sd.Ctx.SignalID = prevSignalID;
+
+      if(DetectH1Divergence(sd))
+      {
+         // Divergence confirmed — advance to wait for CHoCH
+         sd.State = STATE_WAIT_CHOCH;
+      }
+      // If not confirmed, remain in STATE_SCAN_DIV
+   }
+   // Future stages (CHoCH, M5 Retest, Micro-BOS, Entry) are placeholders
+   // for subsequent development iterations per the CONTRIBUTING single-change rule
+}
+
+//+------------------------------------------------------------------+
+//|  OnInit                                                           |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   g_RunID = TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS);
+   // Sanitize RunID for use in filenames if needed
+   StringReplace(g_RunID, ":", "-");
+   StringReplace(g_RunID, " ", "_");
+
+   // Parse symbol list
+   string symList[];
+   int nSym = ParseSymbols(InpSymbols, symList);
+   if(nSym <= 0)
+   {
+      Alert("AWRAFX EA: InpSymbols is empty — no symbols to scan.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   ArrayResize(g_Symbols, nSym);
+   g_SymbolCount = 0;
+
+   for(int i = 0; i < nSym; i++)
+   {
+      string sym = symList[i];
+      if(!SymbolSelect(sym, true))
+      {
+         Print("WARNING: Cannot select symbol ", sym, " — skipping");
+         continue;
+      }
+
+      SSymbolData &sd = g_Symbols[g_SymbolCount];
+      sd.Symbol       = sym;
+      sd.State        = STATE_SCAN_DIV;
+      sd.LastBarTimeH1= 0;
+      sd.LastBarTimeM5= 0;
+
+      // Initialize indicator handles
+      sd.hRSI_H1 = INVALID_HANDLE;
+      sd.hEMA_H1 = INVALID_HANDLE;
+      sd.hATR_H1 = INVALID_HANDLE;
+      sd.hRSI_M5 = INVALID_HANDLE;
+      sd.hEMA_M5 = INVALID_HANDLE;
+      sd.hATR_M5 = INVALID_HANDLE;
+
+      if(!InitHandles(sd))
+      {
+         Print("ERROR: Handle init failed for ", sym, " — skipping");
+         continue;
+      }
+
+      // Initialize signal context
+      ResetContext(sd.Ctx, sym);
+      sd.Ctx.SignalID = 0;
+
+      g_SymbolCount++;
+   }
+
+   if(g_SymbolCount == 0)
+   {
+      Alert("AWRAFX EA: No valid symbols initialized.");
+      return INIT_FAILED;
+   }
+
+   // Compact the array to actual count
+   ArrayResize(g_Symbols, g_SymbolCount);
+
+   // Initialize CSV
+   if(!InitCSV()) return INIT_FAILED;
+
+   Print("AWRAFX TrendDiv EA initialized. Symbols: ", g_SymbolCount,
+         " RunID: ", g_RunID);
+   UpdateDashboard();
+   return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//|  OnDeinit                                                         |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   for(int i = 0; i < g_SymbolCount; i++)
+      ReleaseHandles(g_Symbols[i]);
+
+   if(g_CSVHandle != INVALID_HANDLE)
+   {
+      FileClose(g_CSVHandle);
+      g_CSVHandle = INVALID_HANDLE;
+   }
+
+   Comment(""); // Clear dashboard
+   Print("AWRAFX TrendDiv EA stopped. Reason: ", reason);
+}
+
+//+------------------------------------------------------------------+
+//|  OnTick                                                           |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   bool anyUpdate = false;
+
+   for(int i = 0; i < g_SymbolCount; i++)
+   {
+      SSymbolData &sd = g_Symbols[i];
+
+      // New H1 bar check for this symbol
+      datetime barTime = iTime(sd.Symbol, PERIOD_H1, 0);
+      if(barTime == sd.LastBarTimeH1) continue; // No new bar yet
+      sd.LastBarTimeH1 = barTime;
+
+      ProcessSymbol(i);
+      anyUpdate = true;
+   }
+
+   if(anyUpdate)
+      UpdateDashboard();
+}
+//+------------------------------------------------------------------+

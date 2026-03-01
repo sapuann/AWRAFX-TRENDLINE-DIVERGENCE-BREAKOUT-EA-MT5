@@ -52,6 +52,19 @@ input double   InpTP3_ClosePct     = 0.30;     // Fraction to close at TP3
 input int      InpMagicNumber      = 20250301; // EA magic number
 input int      InpSlippage         = 10;       // Max price slippage in points
 
+//--- Session & Environment Filters
+input bool     InpUseSessionFilter   = true;   // Enable session filter
+input int      InpSessionStartHour   = 7;      // Session start hour (broker/server time)
+input int      InpSessionStartMin    = 0;      // Session start minute
+input int      InpSessionEndHour     = 20;     // Session end hour (broker/server time)
+input int      InpSessionEndMin      = 0;      // Session end minute
+input bool     InpUseFridayCutoff    = true;   // No new entries after Friday cutoff
+input int      InpFridayCutoffHour   = 18;     // Friday cutoff hour (broker/server time)
+input double   InpEntryMaxSpread     = 40;     // Max spread at entry (points) — re-checked before OrderSend
+input bool     InpUseVolatilityGate  = true;   // Enable ATR floor/ceiling gate
+input double   InpATR_H1_FloorMult  = 0.3;    // Min ATR_H1 as fraction of 20-bar ATR average (reject if too quiet)
+input double   InpATR_H1_CeilMult   = 3.0;    // Max ATR_H1 as fraction of 20-bar ATR average (reject if too volatile)
+
 //--- Signal State Machine
 enum ESignalState
 {
@@ -1328,6 +1341,70 @@ void ResetEntryFields(SSymbolData &sd)
 }
 
 //+------------------------------------------------------------------+
+//|  Environment filter: check if current time is within session     |
+//+------------------------------------------------------------------+
+bool IsWithinSession(const string symbol)
+{
+   if(!InpUseSessionFilter) return true;
+
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   int nowMins   = dt.hour * 60 + dt.min;
+   int startMins = InpSessionStartHour * 60 + InpSessionStartMin;
+   int endMins   = InpSessionEndHour   * 60 + InpSessionEndMin;
+
+   if(startMins <= endMins)
+      return (nowMins >= startMins && nowMins < endMins);
+   else // overnight wrap
+      return (nowMins >= startMins || nowMins < endMins);
+}
+
+//+------------------------------------------------------------------+
+//|  Environment filter: return true if Friday cutoff is active      |
+//+------------------------------------------------------------------+
+bool IsFridayCutoff()
+{
+   if(!InpUseFridayCutoff) return false;
+
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   return (dt.day_of_week == 5 && dt.hour >= InpFridayCutoffHour);
+}
+
+//+------------------------------------------------------------------+
+//|  Environment filter: return true if spread is within limit       |
+//+------------------------------------------------------------------+
+bool IsSpreadOK(const string symbol)
+{
+   long spread = SymbolInfoInteger(symbol, SYMBOL_SPREAD);
+   return (spread <= (long)InpEntryMaxSpread);
+}
+
+//+------------------------------------------------------------------+
+//|  Environment filter: check ATR-based volatility gate             |
+//+------------------------------------------------------------------+
+bool IsVolatilityOK(int atrH1Handle)
+{
+   if(!InpUseVolatilityGate) return true;
+
+   double atrBuf[];
+   ArraySetAsSeries(atrBuf, true);
+   if(CopyBuffer(atrH1Handle, 0, 1, 20, atrBuf) < 20) return true; // not enough data — allow
+
+   double current = atrBuf[0];
+   if(current <= 0.0) return true;
+
+   double sum = 0.0;
+   for(int i = 0; i < 20; i++) sum += atrBuf[i];
+   double avg = sum / 20.0;
+   if(avg <= 0.0) return true;
+
+   if(current < avg * InpATR_H1_FloorMult) return false; // too quiet
+   if(current > avg * InpATR_H1_CeilMult)  return false; // too volatile
+   return true;
+}
+
+//+------------------------------------------------------------------+
 //|  Stage 5: Attempt trade entry when STATE_READY_ENTRY              |
 //|  Hard rejections reset state to STATE_SCAN_DIV.                  |
 //|  Soft/transient failures return false without state change.       |
@@ -1338,6 +1415,25 @@ bool TryEnterTrade(int idx)
    SSignalContext &ctx = sd.Ctx;
 
    bool isBuy = (ctx.Bias == "BULL");
+
+   // --- Environment gates (soft rejection — retry next bar) ---
+   if(!IsWithinSession(ctx.Symbol))
+      return false; // silent retry — not within trading session
+
+   if(IsFridayCutoff())
+      return false; // silent retry — Friday cutoff
+
+   if(!IsSpreadOK(ctx.Symbol))
+   {
+      Print(ctx.Symbol, " TryEnterTrade: spread too high, retrying...");
+      return false;
+   }
+
+   if(!IsVolatilityOK(sd.hATR_H1))
+   {
+      Print(ctx.Symbol, " TryEnterTrade: volatility outside range, retrying...");
+      return false;
+   }
 
    // Current entry price (market order)
    double entryPrice = isBuy ? SymbolInfoDouble(ctx.Symbol, SYMBOL_ASK)
@@ -1438,6 +1534,13 @@ bool TryEnterTrade(int idx)
    }
 
    // --- Send market order ---
+   // Final spread check before committing the order
+   if(!IsSpreadOK(ctx.Symbol))
+   {
+      Print(ctx.Symbol, " TryEnterTrade: spread widened before OrderSend, retrying...");
+      return false;
+   }
+
    MqlTradeRequest req = {};
    MqlTradeResult  res = {};
    req.action       = TRADE_ACTION_DEAL;
@@ -1648,7 +1751,50 @@ bool ManageOpenPosition(int idx)
 void UpdateDashboard()
 {
    string dash = "=== AWRAFX TrendDiv EA ===\n";
-   dash += "RunID: " + g_RunID + "\n\n";
+   dash += "RunID: " + g_RunID + "\n";
+
+   // --- Environment status line (uses first symbol for spread/vol if available) ---
+   string envSession = IsWithinSession(g_SymbolCount > 0 ? g_Symbols[0].Symbol : "") ? "OK" : "BLOCKED";
+   string envFriday  = IsFridayCutoff() ? "CUTOFF" : "OK";
+
+   // Spread display (first symbol)
+   string envSpread = "-";
+   if(g_SymbolCount > 0)
+   {
+      long sp = SymbolInfoInteger(g_Symbols[0].Symbol, SYMBOL_SPREAD);
+      envSpread = DoubleToString((double)sp, 1);
+   }
+
+   // Volatility display (first symbol)
+   string envVol = "-";
+   if(g_SymbolCount > 0)
+   {
+      if(!InpUseVolatilityGate)
+         envVol = "OK";
+      else if(IsVolatilityOK(g_Symbols[0].hATR_H1))
+         envVol = "OK";
+      else
+      {
+         // Determine which boundary
+         double atrBuf[];
+         ArraySetAsSeries(atrBuf, true);
+         if(CopyBuffer(g_Symbols[0].hATR_H1, 0, 1, 20, atrBuf) >= 20)
+         {
+            double cur = atrBuf[0];
+            double sum = 0.0;
+            for(int j = 0; j < 20; j++) sum += atrBuf[j];
+            double avg = sum / 20.0;
+            envVol = (cur < avg * InpATR_H1_FloorMult) ? "TOO_QUIET" : "TOO_VOLATILE";
+         }
+         else
+            envVol = "INSUF_DATA";
+      }
+   }
+
+   dash += "Session: " + envSession +
+           " | Spread: " + envSpread +
+           " | Vol: " + envVol +
+           " | Fri: " + envFriday + "\n\n";
 
    for(int i = 0; i < g_SymbolCount; i++)
    {
@@ -1728,6 +1874,10 @@ void ProcessSymbol(int idx)
 
    if(sd.State == STATE_SCAN_DIV)
    {
+      // Skip divergence scanning near weekend to avoid queuing signals we won't trade
+      if(InpUseFridayCutoff && IsFridayCutoff())
+         return;
+
       // Increment SignalID for new attempt
       // (SignalID incremented inside DetectH1Divergence on success)
       // Reset context fields (keep SignalID counter)

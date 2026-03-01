@@ -37,6 +37,21 @@ input double   InpRetestTolATR   = 0.10;        // Retest touch zone tolerance a
 input int      InpMicroBOSTimeout = 60;         // Max M5 bars to wait for micro-BOS
 input int      InpMicroPivotBars  = 3;          // Bars each side for M5 micro pivot detection
 
+//--- Entry Engine & Risk Management Input Parameters
+input double   InpRiskPercent      = 1.0;       // Risk per trade in %
+input double   InpSL_Buffer_ATR_M5 = 0.5;      // SL buffer as fraction of M5 ATR
+input double   InpMaxSL_ATR_H1     = 3.0;      // Reject entry if SL > this multiple of H1 ATR
+input double   InpMinRR            = 1.5;       // Minimum room-to-move ratio vs SL
+input double   InpTP1_ATR_H1       = 1.5;      // TP1 multiple of H1 ATR
+input double   InpTP2_ATR_H1       = 2.5;      // TP2 multiple of H1 ATR
+input double   InpTP3_ATR_H1       = 4.0;      // TP3 multiple of H1 ATR
+input bool     InpUsePartialTP     = true;      // Enable partial closes
+input double   InpTP1_ClosePct     = 0.40;     // Fraction to close at TP1
+input double   InpTP2_ClosePct     = 0.30;     // Fraction to close at TP2
+input double   InpTP3_ClosePct     = 0.30;     // Fraction to close at TP3
+input int      InpMagicNumber      = 20250301; // EA magic number
+input int      InpSlippage         = 10;       // Max price slippage in points
+
 //--- Signal State Machine
 enum ESignalState
 {
@@ -45,6 +60,7 @@ enum ESignalState
    STATE_WAIT_RETEST,   // Waiting for M5 retest/reclaim
    STATE_WAIT_MICROBOS, // Waiting for M5 micro-BOS
    STATE_READY_ENTRY,   // Entry criteria met
+   STATE_MANAGE_TRADE,  // Trade is open, managing position
    STATE_IDLE           // Idle / paused
 };
 
@@ -155,6 +171,18 @@ struct SSymbolData
    // M5 Micro-BOS tracking
    int      MicroBOS_BarsWaited;    // Counter of M5 bars waited in STATE_WAIT_MICROBOS
    datetime MicroBOS_StartTime;     // M5 bar time when STATE_WAIT_MICROBOS was entered
+
+   // Position tracking
+   ulong  PositionTicket;       // Ticket of the open trade
+   double PositionEntryPrice;   // Entry price
+   double PositionOrigVolume;   // Original volume at entry (for partial TP sizing)
+   double PositionSL;           // Current stop-loss
+   double PositionTP1;          // First partial TP level
+   double PositionTP2;          // Second partial TP level
+   double PositionTP3;          // Final TP level
+   bool   TP1_Done;             // Has TP1 partial close been executed?
+   bool   TP2_Done;             // Has TP2 partial close been executed?
+   bool   TP3_Done;             // Has TP3 partial close been executed?
 };
 
 //--- Globals
@@ -1259,6 +1287,359 @@ void ProcessSymbolM5(int idx)
       CheckM5Retest(idx);
    else if(sd.State == STATE_WAIT_MICROBOS)
       CheckMicroBOS(idx);
+   else if(sd.State == STATE_READY_ENTRY)
+      TryEnterTrade(idx);
+}
+
+//+------------------------------------------------------------------+
+//|  Helper: normalize a lot size to symbol volume constraints        |
+//+------------------------------------------------------------------+
+double NormalizeVolume(double lots, const string symbol)
+{
+   double step   = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
+   double minLot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
+   if(step > 0.0)
+      lots = MathFloor(lots / step) * step;
+   if(lots < minLot) lots = minLot;
+   if(lots > maxLot) lots = maxLot;
+   // Determine decimal precision from the step size
+   int digits = 0;
+   double s = step;
+   while(s < 1.0 - 1e-10) { s *= 10.0; digits++; }
+   return NormalizeDouble(lots, digits);
+}
+
+//+------------------------------------------------------------------+
+//|  Helper: reset position tracking fields in SSymbolData            |
+//+------------------------------------------------------------------+
+void ResetEntryFields(SSymbolData &sd)
+{
+   sd.PositionTicket     = 0;
+   sd.PositionEntryPrice = 0.0;
+   sd.PositionOrigVolume = 0.0;
+   sd.PositionSL         = 0.0;
+   sd.PositionTP1        = 0.0;
+   sd.PositionTP2        = 0.0;
+   sd.PositionTP3        = 0.0;
+   sd.TP1_Done           = false;
+   sd.TP2_Done           = false;
+   sd.TP3_Done           = false;
+}
+
+//+------------------------------------------------------------------+
+//|  Stage 5: Attempt trade entry when STATE_READY_ENTRY              |
+//|  Hard rejections reset state to STATE_SCAN_DIV.                  |
+//|  Soft/transient failures return false without state change.       |
+//+------------------------------------------------------------------+
+bool TryEnterTrade(int idx)
+{
+   SSymbolData    &sd  = g_Symbols[idx];
+   SSignalContext &ctx = sd.Ctx;
+
+   bool isBuy = (ctx.Bias == "BULL");
+
+   // Current entry price (market order)
+   double entryPrice = isBuy ? SymbolInfoDouble(ctx.Symbol, SYMBOL_ASK)
+                              : SymbolInfoDouble(ctx.Symbol, SYMBOL_BID);
+
+   // ATR values — soft failure if unavailable (retry next tick)
+   double atrH1 = GetIndicatorValue(sd.hATR_H1, 1);
+   double atrM5 = GetIndicatorValue(sd.hATR_M5, 1);
+   if(atrH1 == EMPTY_VALUE || atrH1 <= 0.0 || atrM5 == EMPTY_VALUE || atrM5 <= 0.0)
+      return false; // transient — do not log, retry
+
+   // --- Compute SL ---
+   double slBuffer = InpSL_Buffer_ATR_M5 * atrM5;
+   double slPrice  = isBuy ? ctx.InvalidationLevel - slBuffer
+                           : ctx.InvalidationLevel + slBuffer;
+   double slDist   = MathAbs(entryPrice - slPrice);
+   if(slDist <= 0.0)
+   {
+      ctx.ReasonCode = "REJECT_SL_ZERO";
+      ctx.ReasonText = "SL distance is zero";
+      WriteCSVRow("REJECT", ctx);
+      int prevID = ctx.SignalID;
+      ResetContext(ctx, ctx.Symbol);
+      ctx.SignalID = prevID;
+      ResetEntryFields(sd);
+      sd.State = STATE_SCAN_DIV;
+      return false;
+   }
+
+   // --- SL width check ---
+   if(slDist > InpMaxSL_ATR_H1 * atrH1)
+   {
+      ctx.ReasonCode = "REJECT_SL_TOO_WIDE";
+      ctx.ReasonText = "SL dist=" + DoubleToString(slDist / atrH1, 2) +
+                       "xATR_H1 > max " + DoubleToString(InpMaxSL_ATR_H1, 1);
+      WriteCSVRow("REJECT", ctx);
+      int prevID = ctx.SignalID;
+      ResetContext(ctx, ctx.Symbol);
+      ctx.SignalID = prevID;
+      ResetEntryFields(sd);
+      sd.State = STATE_SCAN_DIV;
+      return false;
+   }
+
+   // --- Compute TP levels ---
+   double tp1 = isBuy ? entryPrice + InpTP1_ATR_H1 * atrH1
+                      : entryPrice - InpTP1_ATR_H1 * atrH1;
+   double tp2 = isBuy ? entryPrice + InpTP2_ATR_H1 * atrH1
+                      : entryPrice - InpTP2_ATR_H1 * atrH1;
+   double tp3 = isBuy ? entryPrice + InpTP3_ATR_H1 * atrH1
+                      : entryPrice - InpTP3_ATR_H1 * atrH1;
+
+   // --- Room-to-move check ---
+   double minTP = isBuy ? entryPrice + InpMinRR * slDist
+                        : entryPrice - InpMinRR * slDist;
+   bool roomOK  = isBuy ? (tp1 >= minTP) : (tp1 <= minTP);
+   if(!roomOK)
+   {
+      ctx.ReasonCode = "REJECT_NO_ROOM";
+      ctx.ReasonText = "TP1 RR=" + DoubleToString(MathAbs(tp1 - entryPrice) / slDist, 2) +
+                       " < min " + DoubleToString(InpMinRR, 1);
+      WriteCSVRow("REJECT", ctx);
+      int prevID = ctx.SignalID;
+      ResetContext(ctx, ctx.Symbol);
+      ctx.SignalID = prevID;
+      ResetEntryFields(sd);
+      sd.State = STATE_SCAN_DIV;
+      return false;
+   }
+
+   // --- Position sizing ---
+   double balance    = AccountInfoDouble(ACCOUNT_BALANCE);
+   double riskAmt    = balance * InpRiskPercent / 100.0;
+   double tickVal    = SymbolInfoDouble(ctx.Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize   = SymbolInfoDouble(ctx.Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double lotMin     = SymbolInfoDouble(ctx.Symbol, SYMBOL_VOLUME_MIN);
+
+   if(tickVal <= 0.0 || tickSize <= 0.0)
+      return false; // transient — retry next tick
+
+   double riskPerLot = (slDist / tickSize) * tickVal;
+   if(riskPerLot <= 0.0)
+      return false; // transient — retry next tick
+
+   double lots = NormalizeVolume(riskAmt / riskPerLot, ctx.Symbol);
+   if(lots < lotMin)
+   {
+      ctx.ReasonCode = "REJECT_LOT_BELOW_MIN";
+      ctx.ReasonText = "Lot=" + DoubleToString(lots, 2) +
+                       " < min=" + DoubleToString(lotMin, 2);
+      WriteCSVRow("REJECT", ctx);
+      int prevID = ctx.SignalID;
+      ResetContext(ctx, ctx.Symbol);
+      ctx.SignalID = prevID;
+      ResetEntryFields(sd);
+      sd.State = STATE_SCAN_DIV;
+      return false;
+   }
+
+   // --- Send market order ---
+   MqlTradeRequest req = {};
+   MqlTradeResult  res = {};
+   req.action       = TRADE_ACTION_DEAL;
+   req.symbol       = ctx.Symbol;
+   req.volume       = lots;
+   req.type         = isBuy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+   req.price        = entryPrice;
+   req.sl           = slPrice;
+   req.tp           = tp1;
+   req.deviation    = InpSlippage;
+   req.magic        = InpMagicNumber;
+   req.comment      = "AWRAFX_" + ctx.Symbol + "_" + IntegerToString(ctx.SignalID);
+   req.type_filling = ORDER_FILLING_IOC;
+
+   if(!OrderSend(req, res) ||
+      (res.retcode != TRADE_RETCODE_DONE && res.retcode != TRADE_RETCODE_PLACED))
+   {
+      // Transient broker error — do not reset state, retry next tick
+      Print(ctx.Symbol, " TryEnterTrade: OrderSend failed retcode=", res.retcode);
+      return false;
+   }
+
+   // --- Trade opened successfully ---
+   // res.order is the position ticket (order that opened the position)
+   sd.PositionTicket     = res.order;
+   sd.PositionEntryPrice = entryPrice;
+   sd.PositionOrigVolume = lots;
+   sd.PositionSL         = slPrice;
+   sd.PositionTP1        = tp1;
+   sd.PositionTP2        = tp2;
+   sd.PositionTP3        = tp3;
+   sd.TP1_Done           = false;
+   sd.TP2_Done           = false;
+   sd.TP3_Done           = false;
+
+   ctx.Entry_Time  = TimeCurrent();
+   ctx.Entry_Price = entryPrice;
+   ctx.Notes = ctx.Notes + " | Entry@" + DoubleToString(entryPrice, ctx.Digits) +
+               " SL=" + DoubleToString(slPrice, ctx.Digits) +
+               " TP1=" + DoubleToString(tp1, ctx.Digits) +
+               " Lots=" + DoubleToString(lots, 2);
+   WriteCSVRow("SIGNAL", ctx);
+
+   Print(ctx.Symbol, " Trade opened. Ticket=", sd.PositionTicket,
+         " Lots=", DoubleToString(lots, 2),
+         " Entry=", DoubleToString(entryPrice, ctx.Digits),
+         " SL=", DoubleToString(slPrice, ctx.Digits),
+         " TP1=", DoubleToString(tp1, ctx.Digits));
+
+   sd.State = STATE_MANAGE_TRADE;
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//|  Stage 6: Manage open position — partial TPs and state reset     |
+//|  Called on every tick when STATE_MANAGE_TRADE                    |
+//+------------------------------------------------------------------+
+bool ManageOpenPosition(int idx)
+{
+   SSymbolData    &sd  = g_Symbols[idx];
+   SSignalContext &ctx = sd.Ctx;
+
+   // Check if position is still open
+   if(!PositionSelectByTicket(sd.PositionTicket))
+   {
+      Print(ctx.Symbol, " Position closed (ticket=", sd.PositionTicket, ")");
+      ResetEntryFields(sd);
+      int prevID = ctx.SignalID;
+      ResetContext(ctx, ctx.Symbol);
+      ctx.SignalID = prevID;
+      sd.State = STATE_SCAN_DIV;
+      return true; // state changed
+   }
+
+   if(!InpUsePartialTP) return false;
+
+   bool isBuy       = (ctx.Bias == "BULL");
+   double curPrice  = isBuy ? SymbolInfoDouble(ctx.Symbol, SYMBOL_BID)
+                            : SymbolInfoDouble(ctx.Symbol, SYMBOL_ASK);
+   double tickSize  = SymbolInfoDouble(ctx.Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double curVol    = PositionGetDouble(POSITION_VOLUME);
+
+   // --- TP1 ---
+   if(!sd.TP1_Done)
+   {
+      bool tp1Hit = isBuy ? (curPrice >= sd.PositionTP1) : (curPrice <= sd.PositionTP1);
+      if(tp1Hit)
+      {
+         double closeVol = NormalizeVolume(sd.PositionOrigVolume * InpTP1_ClosePct, ctx.Symbol);
+         double minLot   = SymbolInfoDouble(ctx.Symbol, SYMBOL_VOLUME_MIN);
+         if(closeVol > curVol) closeVol = curVol;
+         if(closeVol >= minLot)
+         {
+            MqlTradeRequest req = {};
+            MqlTradeResult  res = {};
+            req.action       = TRADE_ACTION_DEAL;
+            req.symbol       = ctx.Symbol;
+            req.volume       = closeVol;
+            req.type         = isBuy ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+            req.price        = curPrice;
+            req.deviation    = InpSlippage;
+            req.magic        = InpMagicNumber;
+            req.comment      = "AWRAFX_TP1_" + IntegerToString(ctx.SignalID);
+            req.position     = sd.PositionTicket;
+            req.type_filling = ORDER_FILLING_IOC;
+            if(OrderSend(req, res))
+            {
+               sd.TP1_Done = true;
+               // Move SL to breakeven + 1 tick, respecting broker stops level
+               long stopsLevel = SymbolInfoInteger(ctx.Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+               double minDist  = stopsLevel * SymbolInfoDouble(ctx.Symbol, SYMBOL_POINT);
+               double newSL    = isBuy ? sd.PositionEntryPrice + tickSize
+                                       : sd.PositionEntryPrice - tickSize;
+               // Ensure SL meets minimum distance from current price
+               if(isBuy && (curPrice - newSL) < minDist)
+                  newSL = curPrice - minDist;
+               else if(!isBuy && (newSL - curPrice) < minDist)
+                  newSL = curPrice + minDist;
+               MqlTradeRequest modReq = {};
+               MqlTradeResult  modRes = {};
+               modReq.action   = TRADE_ACTION_SLTP;
+               modReq.symbol   = ctx.Symbol;
+               modReq.sl       = newSL;
+               modReq.tp       = sd.PositionTP2;
+               modReq.position = sd.PositionTicket;
+               OrderSend(modReq, modRes);
+               sd.PositionSL = newSL;
+               Print(ctx.Symbol, " TP1 hit. Partial close=", closeVol, " SL moved to BE");
+            }
+         }
+         else
+            sd.TP1_Done = true; // volume too small, skip
+      }
+   }
+   // --- TP2 ---
+   else if(!sd.TP2_Done)
+   {
+      bool tp2Hit = isBuy ? (curPrice >= sd.PositionTP2) : (curPrice <= sd.PositionTP2);
+      if(tp2Hit)
+      {
+         double closeVol = NormalizeVolume(sd.PositionOrigVolume * InpTP2_ClosePct, ctx.Symbol);
+         double minLot   = SymbolInfoDouble(ctx.Symbol, SYMBOL_VOLUME_MIN);
+         if(closeVol > curVol) closeVol = curVol;
+         if(closeVol >= minLot)
+         {
+            MqlTradeRequest req = {};
+            MqlTradeResult  res = {};
+            req.action       = TRADE_ACTION_DEAL;
+            req.symbol       = ctx.Symbol;
+            req.volume       = closeVol;
+            req.type         = isBuy ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+            req.price        = curPrice;
+            req.deviation    = InpSlippage;
+            req.magic        = InpMagicNumber;
+            req.comment      = "AWRAFX_TP2_" + IntegerToString(ctx.SignalID);
+            req.position     = sd.PositionTicket;
+            req.type_filling = ORDER_FILLING_IOC;
+            if(OrderSend(req, res))
+            {
+               sd.TP2_Done = true;
+               MqlTradeRequest modReq = {};
+               MqlTradeResult  modRes = {};
+               modReq.action   = TRADE_ACTION_SLTP;
+               modReq.symbol   = ctx.Symbol;
+               modReq.sl       = sd.PositionSL;
+               modReq.tp       = sd.PositionTP3;
+               modReq.position = sd.PositionTicket;
+               OrderSend(modReq, modRes);
+               Print(ctx.Symbol, " TP2 hit. Partial close=", closeVol);
+            }
+         }
+         else
+            sd.TP2_Done = true;
+      }
+   }
+   // --- TP3 (close all remaining) ---
+   else if(!sd.TP3_Done)
+   {
+      bool tp3Hit = isBuy ? (curPrice >= sd.PositionTP3) : (curPrice <= sd.PositionTP3);
+      if(tp3Hit && curVol > 0.0)
+      {
+         MqlTradeRequest req = {};
+         MqlTradeResult  res = {};
+         req.action       = TRADE_ACTION_DEAL;
+         req.symbol       = ctx.Symbol;
+         req.volume       = curVol;
+         req.type         = isBuy ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+         req.price        = curPrice;
+         req.deviation    = InpSlippage;
+         req.magic        = InpMagicNumber;
+         req.comment      = "AWRAFX_TP3_" + IntegerToString(ctx.SignalID);
+         req.position     = sd.PositionTicket;
+         req.type_filling = ORDER_FILLING_IOC;
+         if(OrderSend(req, res))
+         {
+            sd.TP3_Done = true;
+            Print(ctx.Symbol, " TP3 hit. Full close.");
+         }
+      }
+   }
+
+   return false;
 }
 
 //+------------------------------------------------------------------+
@@ -1280,6 +1661,7 @@ void UpdateDashboard()
          case STATE_WAIT_RETEST:   stateStr = "WAIT_RETEST";   break;
          case STATE_WAIT_MICROBOS: stateStr = "WAIT_MICROBOS"; break;
          case STATE_READY_ENTRY:   stateStr = "READY_ENTRY";   break;
+         case STATE_MANAGE_TRADE:  stateStr = "MANAGE_TRADE";  break;
          default:                  stateStr = "IDLE";           break;
       }
 
@@ -1302,7 +1684,7 @@ void UpdateDashboard()
                     " | " + IntegerToString(barsLeft) + " bars left";
          }
          else if(sd.State == STATE_WAIT_RETEST || sd.State == STATE_WAIT_MICROBOS ||
-                 sd.State == STATE_READY_ENTRY)
+                 sd.State == STATE_READY_ENTRY || sd.State == STATE_MANAGE_TRADE)
          {
             dash += " | CHoCH OK @" + DoubleToString(sd.Ctx.H1_CHoCH_Close, sd.Ctx.Digits);
             if(sd.State == STATE_WAIT_RETEST)
@@ -1320,7 +1702,15 @@ void UpdateDashboard()
             }
             else if(sd.State == STATE_READY_ENTRY)
             {
-               dash += " | READY OK | Waiting for entry engine";
+               dash += " | READY OK | Attempting entry...";
+            }
+            else if(sd.State == STATE_MANAGE_TRADE)
+            {
+               dash += " | IN TRADE | Entry=" + DoubleToString(sd.PositionEntryPrice, sd.Ctx.Digits) +
+                       " SL=" + DoubleToString(sd.PositionSL, sd.Ctx.Digits) +
+                       " TP1=" + DoubleToString(sd.PositionTP1, sd.Ctx.Digits) +
+                       (sd.TP1_Done ? " [TP1✓]" : "") +
+                       (sd.TP2_Done ? " [TP2✓]" : "");
             }
          }
       }
@@ -1404,6 +1794,16 @@ int OnInit()
       sd.Retest_BarsWaited      = 0;
       sd.MicroBOS_BarsWaited    = 0;
       sd.MicroBOS_StartTime     = 0;
+      sd.PositionTicket         = 0;
+      sd.PositionEntryPrice     = 0.0;
+      sd.PositionOrigVolume     = 0.0;
+      sd.PositionSL             = 0.0;
+      sd.PositionTP1            = 0.0;
+      sd.PositionTP2            = 0.0;
+      sd.PositionTP3            = 0.0;
+      sd.TP1_Done               = false;
+      sd.TP2_Done               = false;
+      sd.TP3_Done               = false;
 
       // Initialize indicator handles
       sd.hRSI_H1 = INVALID_HANDLE;
@@ -1483,15 +1883,23 @@ void OnTick()
       }
 
       // New M5 bar check — only when in M5-dependent states
-      if(sd.State == STATE_WAIT_RETEST || sd.State == STATE_WAIT_MICROBOS)
+      if(sd.State == STATE_WAIT_RETEST || sd.State == STATE_WAIT_MICROBOS ||
+         sd.State == STATE_READY_ENTRY)
       {
          datetime barTimeM5 = iTime(sd.Symbol, PERIOD_M5, 0);
          if(barTimeM5 != sd.LastBarTimeM5)
          {
             sd.LastBarTimeM5 = barTimeM5;
-            ProcessSymbolM5(i);  // M5-level processing (retest, micro-BOS)
+            ProcessSymbolM5(i);  // M5-level processing (retest, micro-BOS, entry)
             anyUpdate = true;
          }
+      }
+
+      // Per-tick management for open positions
+      if(sd.State == STATE_MANAGE_TRADE)
+      {
+         if(ManageOpenPosition(i))
+            anyUpdate = true;
       }
    }
 

@@ -29,6 +29,14 @@ input bool     InpWriteCSV       = true;        // Write audit CSV
 input int      InpCHoCHTimeout   = 20;          // Max H1 bars to wait for CHoCH
 input double   InpCHoCHTolATR    = 0.05;        // CHoCH tolerance as fraction of ATR (small buffer)
 
+//--- M5 Retest Stage Input Parameters
+input int      InpRetestTimeout  = 120;         // Max M5 bars to wait for retest (120 = ~10 hours)
+input double   InpRetestTolATR   = 0.10;        // Retest touch zone tolerance as fraction of M5 ATR
+
+//--- M5 Micro-BOS Stage Input Parameters
+input int      InpMicroBOSTimeout = 60;         // Max M5 bars to wait for micro-BOS
+input int      InpMicroPivotBars  = 3;          // Bars each side for M5 micro pivot detection
+
 //--- Signal State Machine
 enum ESignalState
 {
@@ -139,6 +147,14 @@ struct SSymbolData
    // CHoCH wait tracking
    datetime CHoCH_WaitStartBarTime; // H1 bar time when STATE_WAIT_CHOCH was entered
    int      CHoCH_BarsWaited;       // Counter of H1 bars waited so far
+
+   // M5 Retest tracking
+   bool     M5_TouchDetected;       // Whether M5 wick touch of TriggerLevel zone has been detected
+   int      Retest_BarsWaited;      // Counter of M5 bars waited in STATE_WAIT_RETEST
+
+   // M5 Micro-BOS tracking
+   int      MicroBOS_BarsWaited;    // Counter of M5 bars waited in STATE_WAIT_MICROBOS
+   datetime MicroBOS_StartTime;     // M5 bar time when STATE_WAIT_MICROBOS was entered
 };
 
 //--- Globals
@@ -818,7 +834,11 @@ void CheckCHoCH(int idx)
       int prevID = ctx.SignalID;
       ResetContext(ctx, ctx.Symbol);
       ctx.SignalID = prevID;
-      sd.CHoCH_BarsWaited = 0;
+      sd.CHoCH_BarsWaited   = 0;
+      sd.M5_TouchDetected   = false;
+      sd.Retest_BarsWaited  = 0;
+      sd.MicroBOS_BarsWaited= 0;
+      sd.MicroBOS_StartTime = 0;
       sd.State = STATE_SCAN_DIV;
       return;
    }
@@ -835,7 +855,11 @@ void CheckCHoCH(int idx)
          int prevID = ctx.SignalID;
          ResetContext(ctx, ctx.Symbol);
          ctx.SignalID = prevID;
-         sd.CHoCH_BarsWaited = 0;
+         sd.CHoCH_BarsWaited   = 0;
+         sd.M5_TouchDetected   = false;
+         sd.Retest_BarsWaited  = 0;
+         sd.MicroBOS_BarsWaited= 0;
+         sd.MicroBOS_StartTime = 0;
          sd.State = STATE_SCAN_DIV;
          return;
       }
@@ -851,7 +875,11 @@ void CheckCHoCH(int idx)
          int prevID = ctx.SignalID;
          ResetContext(ctx, ctx.Symbol);
          ctx.SignalID = prevID;
-         sd.CHoCH_BarsWaited = 0;
+         sd.CHoCH_BarsWaited   = 0;
+         sd.M5_TouchDetected   = false;
+         sd.Retest_BarsWaited  = 0;
+         sd.MicroBOS_BarsWaited= 0;
+         sd.MicroBOS_StartTime = 0;
          sd.State = STATE_SCAN_DIV;
          return;
       }
@@ -889,8 +917,348 @@ void CheckCHoCH(int idx)
             " Trigger=", DoubleToString(ctx.TriggerLevel, ctx.Digits),
             " Bars waited=", sd.CHoCH_BarsWaited);
 
+      // Initialize M5 retest tracking before entering STATE_WAIT_RETEST
+      sd.M5_TouchDetected  = false;
+      sd.Retest_BarsWaited = 0;
       sd.State = STATE_WAIT_RETEST;
    }
+}
+
+//+------------------------------------------------------------------+
+//|  Stage 3: Check M5 Retest/Reclaim on each new M5 bar             |
+//|  (STATE_WAIT_RETEST)                                             |
+//|                                                                  |
+//|  CRITICAL RULE: Touch uses wick (High/Low) to detect the candle  |
+//|  that reached the zone. Reclaim uses CLOSE ONLY — body must      |
+//|  confirm. Mesti body closed candle — bukan wick.                 |
+//+------------------------------------------------------------------+
+void CheckM5Retest(int idx)
+{
+   SSymbolData    &sd  = g_Symbols[idx];
+   SSignalContext &ctx = sd.Ctx;
+
+   // Count this M5 bar
+   sd.Retest_BarsWaited++;
+
+   double closeM5 = iClose(ctx.Symbol, PERIOD_M5, 1); // last fully closed M5 bar
+
+   // Get M5 ATR for touch tolerance
+   double atrM5 = GetIndicatorValue(sd.hATR_M5, 1);
+   if(atrM5 == EMPTY_VALUE || atrM5 <= 0.0) atrM5 = ctx.ATR_H1 / 12.0; // fallback: H1 ATR / 12 (60 min / 5 min per M5 bar)
+   double tolerance = InpRetestTolATR * atrM5;
+
+   // --- 1. Timeout check ---
+   if(sd.Retest_BarsWaited > InpRetestTimeout)
+   {
+      ctx.ReasonCode = "REJECT_TIMEOUT_WAIT_RETEST";
+      ctx.ReasonText = "Retest timeout after " + IntegerToString(sd.Retest_BarsWaited) + " M5 bars";
+      WriteCSVRow("REJECT", ctx);
+      int prevID = ctx.SignalID;
+      ResetContext(ctx, ctx.Symbol);
+      ctx.SignalID           = prevID;
+      sd.M5_TouchDetected    = false;
+      sd.Retest_BarsWaited   = 0;
+      sd.MicroBOS_BarsWaited = 0;
+      sd.MicroBOS_StartTime  = 0;
+      sd.State = STATE_SCAN_DIV;
+      return;
+   }
+
+   // --- 2. Invalidation check (CLOSE ONLY — body must confirm) ---
+   if(ctx.Bias == "BULL")
+   {
+      if(closeM5 < ctx.InvalidationLevel)
+      {
+         ctx.ReasonCode = "REJECT_NO_RECLAIM";
+         ctx.ReasonText = "M5 invalidation: close " + DoubleToString(closeM5, ctx.Digits) +
+                          " below invalidation " + DoubleToString(ctx.InvalidationLevel, ctx.Digits);
+         WriteCSVRow("REJECT", ctx);
+         int prevID = ctx.SignalID;
+         ResetContext(ctx, ctx.Symbol);
+         ctx.SignalID           = prevID;
+         sd.M5_TouchDetected    = false;
+         sd.Retest_BarsWaited   = 0;
+         sd.MicroBOS_BarsWaited = 0;
+         sd.MicroBOS_StartTime  = 0;
+         sd.State = STATE_SCAN_DIV;
+         return;
+      }
+   }
+   else // BEAR
+   {
+      if(closeM5 > ctx.InvalidationLevel)
+      {
+         ctx.ReasonCode = "REJECT_NO_RECLAIM";
+         ctx.ReasonText = "M5 invalidation: close " + DoubleToString(closeM5, ctx.Digits) +
+                          " above invalidation " + DoubleToString(ctx.InvalidationLevel, ctx.Digits);
+         WriteCSVRow("REJECT", ctx);
+         int prevID = ctx.SignalID;
+         ResetContext(ctx, ctx.Symbol);
+         ctx.SignalID           = prevID;
+         sd.M5_TouchDetected    = false;
+         sd.Retest_BarsWaited   = 0;
+         sd.MicroBOS_BarsWaited = 0;
+         sd.MicroBOS_StartTime  = 0;
+         sd.State = STATE_SCAN_DIV;
+         return;
+      }
+   }
+
+   if(!sd.M5_TouchDetected)
+   {
+      // --- 3. Touch detection via WICK ---
+      // BULL: price pulls back DOWN — M5 Low must touch or go below TriggerLevel + tolerance
+      // BEAR: price pulls back UP   — M5 High must touch or go above TriggerLevel - tolerance
+      bool touched = false;
+      if(ctx.Bias == "BULL")
+         touched = (iLow(ctx.Symbol, PERIOD_M5, 1) <= ctx.TriggerLevel + tolerance);
+      else
+         touched = (iHigh(ctx.Symbol, PERIOD_M5, 1) >= ctx.TriggerLevel - tolerance);
+
+      if(touched)
+      {
+         sd.M5_TouchDetected = true;
+         ctx.M5_Touch_Time   = iTime(ctx.Symbol, PERIOD_M5, 1);
+         ctx.Notes = ctx.Notes + " | M5_Touch@" +
+                     TimeToString(ctx.M5_Touch_Time, TIME_DATE|TIME_MINUTES);
+         Print(ctx.Symbol, " M5 Touch detected. Trigger=",
+               DoubleToString(ctx.TriggerLevel, ctx.Digits),
+               " Bar=", TimeToString(ctx.M5_Touch_Time, TIME_DATE|TIME_MINUTES));
+         // Reclaim is checked on subsequent bars (the NEXT candle must confirm)
+      }
+   }
+   else
+   {
+      // --- 4. Reclaim detection via CLOSE ONLY (body must confirm) ---
+      // BULL: M5 CLOSE > TriggerLevel (body closed above — reclaimed as support)
+      // BEAR: M5 CLOSE < TriggerLevel (body closed below — reclaimed as resistance)
+      bool reclaimed = false;
+      if(ctx.Bias == "BULL")
+         reclaimed = (closeM5 > ctx.TriggerLevel);
+      else
+         reclaimed = (closeM5 < ctx.TriggerLevel);
+
+      if(reclaimed)
+      {
+         ctx.M5_Reclaim_Time = iTime(ctx.Symbol, PERIOD_M5, 1);
+         ctx.Notes = ctx.Notes + " | M5_Reclaim@" +
+                     TimeToString(ctx.M5_Reclaim_Time, TIME_DATE|TIME_MINUTES);
+         WriteCSVRow("SIGNAL", ctx);
+         Print(ctx.Symbol, " M5 Reclaim confirmed. Close=", DoubleToString(closeM5, ctx.Digits),
+               " Trigger=", DoubleToString(ctx.TriggerLevel, ctx.Digits),
+               " Bar=", TimeToString(ctx.M5_Reclaim_Time, TIME_DATE|TIME_MINUTES));
+
+         // Advance to Micro-BOS stage
+         sd.State = STATE_WAIT_MICROBOS;
+         SetupMicroBOS(idx);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//|  Stage 4: Set up Micro-BOS level when entering STATE_WAIT_MICROBOS|
+//|  Called once on the M5 bar where reclaim was confirmed            |
+//+------------------------------------------------------------------+
+void SetupMicroBOS(int idx)
+{
+   SSymbolData    &sd  = g_Symbols[idx];
+   SSignalContext &ctx = sd.Ctx;
+
+   // Initialise wait tracking
+   sd.MicroBOS_BarsWaited = 0;
+   sd.MicroBOS_StartTime  = iTime(ctx.Symbol, PERIOD_M5, 0);
+
+   // Lookback for M5 micro pivot detection — needs room for InpMicroPivotBars each side
+   // +20 provides buffer to find at least a few fully formed pivots in recent price action
+   int lookback = InpMicroPivotBars * 2 + 20;
+
+   int    swIdx[];
+   double swPrc[];
+
+   if(ctx.Bias == "BULL")
+   {
+      // Find swing HIGHs — price must close above the highest one for micro-BOS
+      int swCount = FindPivots(ctx.Symbol, PERIOD_M5, 1,
+                               InpMicroPivotBars, lookback, 5, swIdx, swPrc);
+      if(swCount > 0)
+      {
+         // Use the highest swing high as the level to break
+         double highest = swPrc[0];
+         for(int k = 1; k < swCount; k++)
+            if(swPrc[k] > highest) highest = swPrc[k];
+         ctx.M5_MicroLevel = highest;
+      }
+      else
+      {
+         // Fallback: recent highest high
+         int barHigh = iHighest(ctx.Symbol, PERIOD_M5, MODE_HIGH, lookback, 1);
+         ctx.M5_MicroLevel = iHigh(ctx.Symbol, PERIOD_M5, barHigh);
+      }
+   }
+   else // BEAR
+   {
+      // Find swing LOWs — price must close below the lowest one for micro-BOS
+      int swCount = FindPivots(ctx.Symbol, PERIOD_M5, -1,
+                               InpMicroPivotBars, lookback, 5, swIdx, swPrc);
+      if(swCount > 0)
+      {
+         // Use the lowest swing low as the level to break
+         double lowest = swPrc[0];
+         for(int k = 1; k < swCount; k++)
+            if(swPrc[k] < lowest) lowest = swPrc[k];
+         ctx.M5_MicroLevel = lowest;
+      }
+      else
+      {
+         // Fallback: recent lowest low
+         int barLow = iLowest(ctx.Symbol, PERIOD_M5, MODE_LOW, lookback, 1);
+         ctx.M5_MicroLevel = iLow(ctx.Symbol, PERIOD_M5, barLow);
+      }
+   }
+
+   Print(ctx.Symbol, " Micro-BOS setup — Bias=", ctx.Bias,
+         " MicroLevel=", DoubleToString(ctx.M5_MicroLevel, ctx.Digits));
+}
+
+//+------------------------------------------------------------------+
+//|  Stage 4: Check M5 Micro-BOS on each new M5 bar                  |
+//|  (STATE_WAIT_MICROBOS)                                           |
+//|                                                                  |
+//|  CRITICAL RULE: CLOSE ONLY — body must confirm the break.        |
+//|  Mesti body closed candle — bukan wick.                          |
+//+------------------------------------------------------------------+
+void CheckMicroBOS(int idx)
+{
+   SSymbolData    &sd  = g_Symbols[idx];
+   SSignalContext &ctx = sd.Ctx;
+
+   // Count this M5 bar
+   sd.MicroBOS_BarsWaited++;
+
+   double closeM5 = iClose(ctx.Symbol, PERIOD_M5, 1); // last fully closed M5 bar
+
+   // --- 1. Timeout check ---
+   if(sd.MicroBOS_BarsWaited > InpMicroBOSTimeout)
+   {
+      ctx.ReasonCode = "REJECT_NO_MICROBOS";
+      ctx.ReasonText = "Micro-BOS timeout after " + IntegerToString(sd.MicroBOS_BarsWaited) + " M5 bars";
+      WriteCSVRow("REJECT", ctx);
+      int prevID = ctx.SignalID;
+      ResetContext(ctx, ctx.Symbol);
+      ctx.SignalID           = prevID;
+      sd.M5_TouchDetected    = false;
+      sd.Retest_BarsWaited   = 0;
+      sd.MicroBOS_BarsWaited = 0;
+      sd.MicroBOS_StartTime  = 0;
+      sd.State = STATE_SCAN_DIV;
+      return;
+   }
+
+   // --- 2. Invalidation check (CLOSE ONLY — body must confirm) ---
+   if(ctx.Bias == "BULL")
+   {
+      if(closeM5 < ctx.InvalidationLevel)
+      {
+         ctx.ReasonCode = "REJECT_NO_MICROBOS";
+         ctx.ReasonText = "M5 invalidation: close " + DoubleToString(closeM5, ctx.Digits) +
+                          " below invalidation " + DoubleToString(ctx.InvalidationLevel, ctx.Digits);
+         WriteCSVRow("REJECT", ctx);
+         int prevID = ctx.SignalID;
+         ResetContext(ctx, ctx.Symbol);
+         ctx.SignalID           = prevID;
+         sd.M5_TouchDetected    = false;
+         sd.Retest_BarsWaited   = 0;
+         sd.MicroBOS_BarsWaited = 0;
+         sd.MicroBOS_StartTime  = 0;
+         sd.State = STATE_SCAN_DIV;
+         return;
+      }
+   }
+   else // BEAR
+   {
+      if(closeM5 > ctx.InvalidationLevel)
+      {
+         ctx.ReasonCode = "REJECT_NO_MICROBOS";
+         ctx.ReasonText = "M5 invalidation: close " + DoubleToString(closeM5, ctx.Digits) +
+                          " above invalidation " + DoubleToString(ctx.InvalidationLevel, ctx.Digits);
+         WriteCSVRow("REJECT", ctx);
+         int prevID = ctx.SignalID;
+         ResetContext(ctx, ctx.Symbol);
+         ctx.SignalID           = prevID;
+         sd.M5_TouchDetected    = false;
+         sd.Retest_BarsWaited   = 0;
+         sd.MicroBOS_BarsWaited = 0;
+         sd.MicroBOS_StartTime  = 0;
+         sd.State = STATE_SCAN_DIV;
+         return;
+      }
+   }
+
+   // --- 3. Dynamic MicroLevel update — rescan for new swing points ---
+   // Use same lookback as SetupMicroBOS: InpMicroPivotBars each side + 20 bar buffer
+   int lookback = InpMicroPivotBars * 2 + 20;
+   int    swIdx[];
+   double swPrc[];
+
+   if(ctx.Bias == "BULL")
+   {
+      int swCount = FindPivots(ctx.Symbol, PERIOD_M5, 1,
+                               InpMicroPivotBars, lookback, 5, swIdx, swPrc);
+      if(swCount > 0)
+      {
+         double highest = swPrc[0];
+         for(int k = 1; k < swCount; k++)
+            if(swPrc[k] > highest) highest = swPrc[k];
+         if(highest > ctx.M5_MicroLevel)
+            ctx.M5_MicroLevel = highest; // update only if a new higher swing high formed
+      }
+   }
+   else // BEAR
+   {
+      int swCount = FindPivots(ctx.Symbol, PERIOD_M5, -1,
+                               InpMicroPivotBars, lookback, 5, swIdx, swPrc);
+      if(swCount > 0)
+      {
+         double lowest = swPrc[0];
+         for(int k = 1; k < swCount; k++)
+            if(swPrc[k] < lowest) lowest = swPrc[k];
+         if(lowest < ctx.M5_MicroLevel)
+            ctx.M5_MicroLevel = lowest; // update only if a new lower swing low formed
+      }
+   }
+
+   // --- 4. Micro-BOS confirmation via CLOSE ONLY (body must confirm the break) ---
+   bool bosConfirmed = false;
+   if(ctx.Bias == "BULL")
+      bosConfirmed = (closeM5 > ctx.M5_MicroLevel);
+   else
+      bosConfirmed = (closeM5 < ctx.M5_MicroLevel);
+
+   if(bosConfirmed)
+   {
+      ctx.M5_MicroBOS_Time = iTime(ctx.Symbol, PERIOD_M5, 1);
+      ctx.Notes = ctx.Notes + " | M5_uBOS@" + DoubleToString(ctx.M5_MicroLevel, ctx.Digits) +
+                  " T=" + TimeToString(ctx.M5_MicroBOS_Time, TIME_DATE|TIME_MINUTES);
+      WriteCSVRow("SIGNAL", ctx);
+      Print(ctx.Symbol, " M5 Micro-BOS confirmed. Close=", DoubleToString(closeM5, ctx.Digits),
+            " MicroLevel=", DoubleToString(ctx.M5_MicroLevel, ctx.Digits),
+            " Bar=", TimeToString(ctx.M5_MicroBOS_Time, TIME_DATE|TIME_MINUTES));
+
+      sd.State = STATE_READY_ENTRY;
+   }
+}
+
+//+------------------------------------------------------------------+
+//|  Process one symbol on a new M5 bar — routes to correct handler  |
+//+------------------------------------------------------------------+
+void ProcessSymbolM5(int idx)
+{
+   SSymbolData &sd = g_Symbols[idx];
+
+   if(sd.State == STATE_WAIT_RETEST)
+      CheckM5Retest(idx);
+   else if(sd.State == STATE_WAIT_MICROBOS)
+      CheckMicroBOS(idx);
 }
 
 //+------------------------------------------------------------------+
@@ -937,6 +1305,23 @@ void UpdateDashboard()
                  sd.State == STATE_READY_ENTRY)
          {
             dash += " | CHoCH OK @" + DoubleToString(sd.Ctx.H1_CHoCH_Close, sd.Ctx.Digits);
+            if(sd.State == STATE_WAIT_RETEST)
+            {
+               int barsLeft = InpRetestTimeout - sd.Retest_BarsWaited;
+               string touchStr = sd.M5_TouchDetected ? "YES" : "NO";
+               dash += " | M5 Retest | Touch=" + touchStr +
+                       " | " + IntegerToString(barsLeft) + " bars left";
+            }
+            else if(sd.State == STATE_WAIT_MICROBOS)
+            {
+               int barsLeft = InpMicroBOSTimeout - sd.MicroBOS_BarsWaited;
+               dash += " | M5 uBOS@" + DoubleToString(sd.Ctx.M5_MicroLevel, sd.Ctx.Digits) +
+                       " | " + IntegerToString(barsLeft) + " bars left";
+            }
+            else if(sd.State == STATE_READY_ENTRY)
+            {
+               dash += " | READY OK | Waiting for entry engine";
+            }
          }
       }
       dash += "\n";
@@ -973,8 +1358,8 @@ void ProcessSymbol(int idx)
       // Check for CHoCH confirmation on each new H1 bar
       CheckCHoCH(idx);
    }
-   // Future stages (M5 Retest, Micro-BOS, Entry) are placeholders
-   // for subsequent development iterations per the CONTRIBUTING single-change rule
+   // M5 states (WAIT_RETEST, WAIT_MICROBOS) are handled by ProcessSymbolM5()
+   // which is called from OnTick() on each new M5 bar
 }
 
 //+------------------------------------------------------------------+
@@ -1015,6 +1400,10 @@ int OnInit()
       sd.LastBarTimeM5= 0;
       sd.CHoCH_WaitStartBarTime = 0;
       sd.CHoCH_BarsWaited       = 0;
+      sd.M5_TouchDetected       = false;
+      sd.Retest_BarsWaited      = 0;
+      sd.MicroBOS_BarsWaited    = 0;
+      sd.MicroBOS_StartTime     = 0;
 
       // Initialize indicator handles
       sd.hRSI_H1 = INVALID_HANDLE;
@@ -1085,12 +1474,25 @@ void OnTick()
       SSymbolData &sd = g_Symbols[i];
 
       // New H1 bar check for this symbol
-      datetime barTime = iTime(sd.Symbol, PERIOD_H1, 0);
-      if(barTime == sd.LastBarTimeH1) continue; // No new bar yet
-      sd.LastBarTimeH1 = barTime;
+      datetime barTimeH1 = iTime(sd.Symbol, PERIOD_H1, 0);
+      if(barTimeH1 != sd.LastBarTimeH1)
+      {
+         sd.LastBarTimeH1 = barTimeH1;
+         ProcessSymbol(i);   // H1-level processing (divergence, CHoCH)
+         anyUpdate = true;
+      }
 
-      ProcessSymbol(i);
-      anyUpdate = true;
+      // New M5 bar check — only when in M5-dependent states
+      if(sd.State == STATE_WAIT_RETEST || sd.State == STATE_WAIT_MICROBOS)
+      {
+         datetime barTimeM5 = iTime(sd.Symbol, PERIOD_M5, 0);
+         if(barTimeM5 != sd.LastBarTimeM5)
+         {
+            sd.LastBarTimeM5 = barTimeM5;
+            ProcessSymbolM5(i);  // M5-level processing (retest, micro-BOS)
+            anyUpdate = true;
+         }
+      }
    }
 
    if(anyUpdate)

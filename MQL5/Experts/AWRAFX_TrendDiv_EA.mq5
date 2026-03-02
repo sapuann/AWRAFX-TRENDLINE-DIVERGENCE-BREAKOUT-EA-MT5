@@ -196,6 +196,10 @@ struct SSymbolData
    bool   TP1_Done;             // Has TP1 partial close been executed?
    bool   TP2_Done;             // Has TP2 partial close been executed?
    bool   TP3_Done;             // Has TP3 partial close been executed?
+
+   // MAE/MFE tracking
+   double TradeMAE;             // Maximum adverse excursion in price (worst drawdown from entry)
+   double TradeMFE;             // Maximum favorable excursion in price (best unrealized profit from entry)
 };
 
 //--- Globals
@@ -203,6 +207,16 @@ SSymbolData  g_Symbols[];          // Array of symbol data
 int          g_SymbolCount  = 0;   // Number of active symbols
 string       g_RunID        = "";  // EA start timestamp as string
 int          g_CSVHandle    = INVALID_HANDLE; // CSV file handle
+
+//--- Global KPI counters
+int    g_TotalSignals = 0;
+int    g_Wins         = 0;
+int    g_Losses       = 0;
+int    g_Breakeven    = 0;
+double g_SumMAE_R     = 0.0;
+double g_SumMFE_R     = 0.0;
+double g_SumProfit    = 0.0;
+double g_SumLoss      = 0.0;
 
 //--- CSV header (locked per TRACEABILITY_RULES.md)
 const string CSV_HEADER =
@@ -1575,6 +1589,9 @@ bool TryEnterTrade(int idx)
    sd.TP1_Done           = false;
    sd.TP2_Done           = false;
    sd.TP3_Done           = false;
+   sd.TradeMAE           = 0.0;
+   sd.TradeMFE           = 0.0;
+   g_TotalSignals++;
 
    ctx.Entry_Time  = TimeCurrent();
    ctx.Entry_Price = entryPrice;
@@ -1607,12 +1624,61 @@ bool ManageOpenPosition(int idx)
    if(!PositionSelectByTicket(sd.PositionTicket))
    {
       Print(ctx.Symbol, " Position closed (ticket=", sd.PositionTicket, ")");
+
+      // --- Compute final Result, MAE_R, MFE_R and write CLOSED row ---
+      double slDist = MathAbs(sd.PositionEntryPrice - sd.PositionSL);
+      double finalPnL = 0.0;
+      // Try to get profit from history
+      if(HistorySelectByPosition(sd.PositionTicket))
+      {
+         int deals = HistoryDealsTotal();
+         for(int d = 0; d < deals; d++)
+         {
+            ulong dTicket = HistoryDealGetTicket(d);
+            if(dTicket > 0)
+               finalPnL += HistoryDealGetDouble(dTicket, DEAL_PROFIT);
+         }
+      }
+      double tickSize = SymbolInfoDouble(ctx.Symbol, SYMBOL_TRADE_TICK_SIZE);
+      ctx.MAE_R = 0.0;
+      ctx.MFE_R = 0.0;
+      if(slDist > tickSize)
+      {
+         ctx.MAE_R = sd.TradeMAE / slDist;
+         ctx.MFE_R = sd.TradeMFE / slDist;
+      }
+      if(finalPnL > 0.0)
+         ctx.Result = "WIN";
+      else if(finalPnL < 0.0)
+         ctx.Result = "LOSS";
+      else
+         ctx.Result = "BE";
+      WriteCSVRow("CLOSED", ctx);
+
+      // Update global KPI counters
+      g_SumMAE_R += ctx.MAE_R;
+      g_SumMFE_R += ctx.MFE_R;
+      if(ctx.Result == "WIN")      { g_Wins++;      g_SumProfit += finalPnL; }
+      else if(ctx.Result == "LOSS"){ g_Losses++;    g_SumLoss   += MathAbs(finalPnL); }
+      else                          { g_Breakeven++; }
+
       ResetEntryFields(sd);
       int prevID = ctx.SignalID;
       ResetContext(ctx, ctx.Symbol);
       ctx.SignalID = prevID;
       sd.State = STATE_SCAN_DIV;
       return true; // state changed
+   }
+
+   // --- Track MAE/MFE on every tick while position is open ---
+   {
+      bool   isBuyPos    = (ctx.Bias == "BULL");
+      double curPricePos = isBuyPos ? SymbolInfoDouble(ctx.Symbol, SYMBOL_BID)
+                                    : SymbolInfoDouble(ctx.Symbol, SYMBOL_ASK);
+      double unrealPnL   = isBuyPos ? (curPricePos - sd.PositionEntryPrice)
+                                    : (sd.PositionEntryPrice - curPricePos);
+      sd.TradeMAE = MathMin(sd.TradeMAE, unrealPnL);
+      sd.TradeMFE = MathMax(sd.TradeMFE, unrealPnL);
    }
 
    if(!InpUsePartialTP) return false;
@@ -1622,8 +1688,6 @@ bool ManageOpenPosition(int idx)
                             : SymbolInfoDouble(ctx.Symbol, SYMBOL_ASK);
    double tickSize  = SymbolInfoDouble(ctx.Symbol, SYMBOL_TRADE_TICK_SIZE);
    double curVol    = PositionGetDouble(POSITION_VOLUME);
-
-   // --- TP1 ---
    if(!sd.TP1_Done)
    {
       bool tp1Hit = isBuy ? (curPrice >= sd.PositionTP1) : (curPrice <= sd.PositionTP1);
@@ -1862,6 +1926,21 @@ void UpdateDashboard()
       }
       dash += "\n";
    }
+
+   // KPI summary line
+   int closed = g_Wins + g_Losses + g_Breakeven;
+   double winrate = (closed > 0) ? (100.0 * g_Wins / closed) : 0.0;
+   double avgMAE  = (closed > 0) ? (g_SumMAE_R / closed) : 0.0;
+   double avgMFE  = (closed > 0) ? (g_SumMFE_R / closed) : 0.0;
+   double pf      = (g_SumLoss > 0.0) ? (g_SumProfit / g_SumLoss) : 0.0;
+   dash += "KPI: W=" + IntegerToString(g_Wins) +
+           " L=" + IntegerToString(g_Losses) +
+           " BE=" + IntegerToString(g_Breakeven) +
+           " | WR=" + DoubleToString(winrate, 1) + "%" +
+           " | avgMAE=" + DoubleToString(avgMAE, 2) + "R" +
+           " | avgMFE=" + DoubleToString(avgMFE, 2) + "R" +
+           " | PF=" + DoubleToString(pf, 2) + "\n";
+
    Comment(dash);
 }
 
@@ -1954,6 +2033,8 @@ int OnInit()
       sd.TP1_Done               = false;
       sd.TP2_Done               = false;
       sd.TP3_Done               = false;
+      sd.TradeMAE               = 0.0;
+      sd.TradeMFE               = 0.0;
 
       // Initialize indicator handles
       sd.hRSI_H1 = INVALID_HANDLE;
@@ -2006,6 +2087,35 @@ void OnDeinit(const int reason)
    {
       FileClose(g_CSVHandle);
       g_CSVHandle = INVALID_HANDLE;
+   }
+
+   // Write KPI summary file
+   if(InpWriteCSV)
+   {
+      int kpiHandle = FileOpen("FinalSpec_KPI_Summary.csv",
+                               FILE_WRITE|FILE_CSV|FILE_COMMON, ',');
+      if(kpiHandle != INVALID_HANDLE)
+      {
+         int closed = g_Wins + g_Losses + g_Breakeven;
+         double winrate = (closed > 0) ? (100.0 * g_Wins / closed) : 0.0;
+         double avgMAE  = (closed > 0) ? (g_SumMAE_R / closed) : 0.0;
+         double avgMFE  = (closed > 0) ? (g_SumMFE_R / closed) : 0.0;
+         double pf      = (g_SumLoss > 0.0) ? (g_SumProfit / g_SumLoss) : 0.0;
+
+         FileWrite(kpiHandle,
+            "RunID,TotalSignals,Wins,Losses,BE,Winrate,AvgMAE_R,AvgMFE_R,ProfitFactor");
+         FileWrite(kpiHandle,
+            g_RunID + "," +
+            IntegerToString(g_TotalSignals) + "," +
+            IntegerToString(g_Wins)         + "," +
+            IntegerToString(g_Losses)       + "," +
+            IntegerToString(g_Breakeven)    + "," +
+            DoubleToString(winrate, 2)      + "," +
+            DoubleToString(avgMAE,  4)      + "," +
+            DoubleToString(avgMFE,  4)      + "," +
+            DoubleToString(pf,      4));
+         FileClose(kpiHandle);
+      }
    }
 
    Comment(""); // Clear dashboard
